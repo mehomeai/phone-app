@@ -1,0 +1,16 @@
+{
+  "name": "@mehomeai/phone-app-home-client",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Portable paired-home service/client adapter and contract fixtures for phone-app (Expo prototype plug-in target). Zero runtime dependencies.",
+  "type": "module",
+  "engines": { "node": ">=24.18.0 <25" },
+  "scripts": {
+    "test": "node --experimental-transform-types --disable-warning=ExperimentalWarning --test tests/*.test.ts",
+    "test:live": "node --experimental-transform-types --disable-warning=ExperimentalWarning scripts/run-live-integration.ts",
+    "test:real": "node --experimental-transform-types --disable-warning=ExperimentalWarning --test test/real-services.test.mjs",
+    "test:all": "npm test --silent && npm run test:real --silent",
+    "check": "python3 scripts/check_repository.py"
+  },
+  "license": "Apache-2.0"
+}
