@@ -21,7 +21,11 @@ function ask(title: string, msg: string, action: string, onYes: () => void) {
 
 export function SettingsPanel() {
   const c = useColors();
-  const { profiles, activeProfile, setActiveProfile, addProfile, settings, updateSettings, resetDemo, connectionStatus } = useMe();
+  const {
+    profiles, activeProfile, setActiveProfile, addProfile, settings, updateSettings, resetDemo,
+    connectionStatus, requestedUpstreamMode, setRequestedUpstreamMode, upstreamSelection,
+    upstreamSetupMessage, upstreamBots, upstreamBotsLoading, upstreamBotsError, refreshUpstreamBots,
+  } = useMe();
   const [editing, setEditing] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const isChild = activeProfile.role === 'child';
@@ -118,6 +122,66 @@ export function SettingsPanel() {
             <Feather name="chevron-right" size={18} color={c.mutedForeground} />
           </Pressable>
         </Card>
+
+        {settings.assistantMode === 'home' ? (
+          <>
+            <Eyebrow style={{ marginTop: 26, marginBottom: 10 }}>Assistant</Eyebrow>
+            <Card style={{ paddingVertical: 4 }}>
+              <View style={[st.row, { paddingVertical: 14 }]}>
+                <View style={{ flex: 1 }}>
+                  <Text style={{ fontFamily: F.medium, fontSize: 15, color: c.foreground }}>Full agent mode</Text>
+                  <Text style={{ fontFamily: F.regular, fontSize: 13, color: c.mutedForeground, marginTop: 2 }}>
+                    {upstreamSelection === 'full'
+                      ? `On — your chats run on your home's full agent${upstreamBots ? ` (${upstreamBots.length} available)` : ''}.`
+                      : upstreamSelection === 'setup-needed'
+                        ? 'Requested, but this home is not set up for it yet.'
+                        : 'Off — classic replies.'}
+                  </Text>
+                  {upstreamSelection === 'setup-needed' && upstreamSetupMessage ? (
+                    <Text testID="upstream-setup-message" style={{ fontFamily: F.regular, fontSize: 13, color: c.destructive, marginTop: 6 }}>
+                      {upstreamSetupMessage}
+                    </Text>
+                  ) : null}
+                  {upstreamBotsError ? (
+                    <Text style={{ fontFamily: F.regular, fontSize: 13, color: c.destructive, marginTop: 6 }}>
+                      Couldn&apos;t load the list: {upstreamBotsError}
+                    </Text>
+                  ) : null}
+                </View>
+                <Switch
+                  testID="upstream-mode-toggle"
+                  value={requestedUpstreamMode === 'full'}
+                  disabled={connectionStatus !== 'connected'}
+                  onValueChange={(v) => { tap(); setRequestedUpstreamMode(v ? 'full' : 'legacy'); }}
+                  trackColor={{ true: c.accent, false: c.input }}
+                  thumbColor={c.card}
+                />
+              </View>
+              {requestedUpstreamMode === 'full' && upstreamSelection === 'full' ? (
+                <Pressable
+                  testID="refresh-upstream-bots"
+                  accessibilityRole="button"
+                  accessibilityLabel="Refresh the assistant list"
+                  onPress={() => { tap(); void refreshUpstreamBots(); }}
+                  disabled={upstreamBotsLoading}
+                  style={[st.row, { paddingVertical: 14, borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: c.border, opacity: upstreamBotsLoading ? 0.5 : 1 }]}
+                >
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ fontFamily: F.medium, fontSize: 15, color: c.foreground }}>
+                      {upstreamBotsLoading ? 'Loading…' : 'Refresh the assistant list'}
+                    </Text>
+                    {upstreamBots ? (
+                      <Text style={{ fontFamily: F.regular, fontSize: 13, color: c.mutedForeground, marginTop: 2 }}>
+                        {upstreamBots.map((b) => b.name).join(', ') || 'None available'}
+                      </Text>
+                    ) : null}
+                  </View>
+                  <Feather name="refresh-cw" size={18} color={c.mutedForeground} />
+                </Pressable>
+              ) : null}
+            </Card>
+          </>
+        ) : null}
 
         <Eyebrow style={{ marginTop: 26, marginBottom: 10 }}>Privacy & data</Eyebrow>
         <Card>

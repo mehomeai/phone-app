@@ -8,6 +8,7 @@ import { isLiquidGlassAvailable } from 'expo-glass-effect';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { F, MeMark, tap, useTopInset } from '@/components/ui';
 import { TaskPanel } from '@/components/TaskPanel';
+import { maskApprovalArgs } from '@/lib/home-client';
 import { useMe } from '@/context/MeContext';
 import { useColors } from '@/hooks/useColors';
 import type { Message } from '@/lib/types';
@@ -38,6 +39,24 @@ export function ChatComposer({ conversationId, onConversationId, showBack = fals
     createConversation,
     deleteConversation,
     activeProfile,
+    upstreamSelection,
+    upstreamSetupMessage,
+    isNativeConversation,
+    nativeTasksByConv,
+    nativeTasksLoading,
+    nativeTasksError,
+    refreshNativeTasks,
+    retryNativeTask,
+    nativeApprovals,
+    nativeApprovalsLoading,
+    nativeApprovalsError,
+    nativeApprovalsBusy,
+    refreshNativeApprovals,
+    decideNativeApproval,
+    nativeAnswers,
+    setNativeAnswer,
+    respondNativeQuestion,
+    nativeWatchState,
   } = useMe();
   const [text, setText] = useState('');
   const inputRef = useRef<React.ComponentRef<typeof TextInput>>(null);
@@ -50,7 +69,12 @@ export function ChatComposer({ conversationId, onConversationId, showBack = fals
   const messages = conv?.messages ?? [];
   const isTyping = !!(id && typing[id]);
   const chatError = id ? chatErrors[id] : undefined;
-  const canSend = settings.assistantMode === 'demo' || connectionStatus === 'connected' || connectionStatus === 'offline';
+  // FULL requested but the home is not set up: refuse honestly (never send
+  // into the wrong engine). Legacy/demo behavior is unchanged.
+  const setupBlocked = settings.assistantMode === 'home' && upstreamSelection === 'setup-needed';
+  const canSend = (settings.assistantMode === 'demo' || connectionStatus === 'connected' || connectionStatus === 'offline') && !setupBlocked;
+  const nativeActive = settings.assistantMode === 'home' && !!id && isNativeConversation(id);
+  const watchState = id ? nativeWatchState[id] : undefined;
   const title = conv?.title ?? 'Me';
 
   useEffect(() => {
@@ -121,17 +145,19 @@ export function ChatComposer({ conversationId, onConversationId, showBack = fals
           ) : null}
           <View style={{ flex: 1, alignItems: showBack ? 'center' : 'flex-start' }}>
             <Text numberOfLines={1} style={{ fontFamily: F.medium, fontSize: 16, color: c.foreground }}>{title}</Text>
-            {settings.assistantMode !== 'demo' ? (
+              {settings.assistantMode !== 'demo' ? (
               <Text style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1, color: connectionStatus === 'connected' ? c.accent : c.destructive }}>
-                {connectionStatus === 'connected'
-                  ? 'ME HOME · PRIVATE CONNECTION'
-                  : connectionStatus === 'connecting'
-                    ? 'ME HOME · CONNECTING'
-                    : connectionStatus === 'offline'
-                      ? 'ME HOME · OFFLINE · WILL QUEUE'
-                      : connectionStatus === 'error'
-                        ? 'ME HOME · CONNECTION ERROR'
-                        : 'ME HOME · DISCONNECTED'}
+                {upstreamSelection === 'setup-needed'
+                  ? 'ME HOME · SETUP NEEDED'
+                  : connectionStatus === 'connected'
+                    ? 'ME HOME · PRIVATE CONNECTION'
+                    : connectionStatus === 'connecting'
+                      ? 'ME HOME · CONNECTING'
+                      : connectionStatus === 'offline'
+                        ? 'ME HOME · OFFLINE · WILL QUEUE'
+                        : connectionStatus === 'error'
+                          ? 'ME HOME · CONNECTION ERROR'
+                          : 'ME HOME · DISCONNECTED'}
               </Text>
             ) : null}
           </View>
@@ -188,7 +214,50 @@ export function ChatComposer({ conversationId, onConversationId, showBack = fals
             </Pressable>
           </View>
         ) : null}
-        {settings.assistantMode === 'home' ? <TaskPanel conversationId={id ?? null} /> : null}
+        {setupBlocked && upstreamSetupMessage ? (
+          <View testID="upstream-setup-needed" accessibilityLiveRegion="assertive" style={[st.error, { backgroundColor: c.muted, borderColor: c.border }]}>
+            <Text style={{ flex: 1, fontFamily: F.regular, fontSize: 13, lineHeight: 18, color: c.destructive }}>{upstreamSetupMessage}</Text>
+          </View>
+        ) : null}
+        {settings.assistantMode === 'home' && !nativeActive ? <TaskPanel conversationId={id ?? null} /> : null}
+        {nativeActive && id ? (
+          <NativeTaskSection
+            tasks={nativeTasksByConv[id] ?? []}
+            loading={!!nativeTasksLoading[id]}
+            error={nativeTasksError[id] ?? null}
+            onRefresh={() => { void refreshNativeTasks(id); }}
+            onRetry={(taskId) => { void retryNativeTask(taskId); }}
+          />
+        ) : null}
+        {nativeActive ? (
+          <NativeRequestsSection
+            inbox={nativeApprovals}
+            loading={nativeApprovalsLoading}
+            error={nativeApprovalsError}
+            busy={nativeApprovalsBusy}
+            answers={nativeAnswers}
+            onRefresh={() => { void refreshNativeApprovals(); }}
+            onDecide={(requestId, decision) => { void decideNativeApproval(requestId, decision); }}
+            onAnswerText={(questionId, answer) => { setNativeAnswer(questionId, answer); }}
+            onRespond={(questionId) => { void respondNativeQuestion(questionId); }}
+          />
+        ) : null}
+        {nativeActive && watchState === 'stale' && id ? (
+          <View testID="native-still-working" style={[st.error, { backgroundColor: c.muted, borderColor: c.border }]}>
+            <Text style={{ flex: 1, fontFamily: F.regular, fontSize: 13, lineHeight: 18, color: c.mutedForeground }}>
+              Still working in the background. New replies will appear here on their own.
+            </Text>
+            <Pressable
+              testID="native-refresh-now"
+              accessibilityRole="button"
+              accessibilityLabel="Check for new replies now"
+              onPress={() => openConversation(id)}
+              style={{ padding: 6 }}
+            >
+              <Text style={{ fontFamily: F.medium, fontSize: 13, color: c.accent }}>Check now</Text>
+            </Pressable>
+          </View>
+        ) : null}
         <View style={[st.inputBar, { paddingBottom: bottomPad, borderTopColor: c.border, backgroundColor: c.background }]}>
           <TextInput
             ref={inputRef}
@@ -196,7 +265,7 @@ export function ChatComposer({ conversationId, onConversationId, showBack = fals
             value={text}
             onChangeText={setText}
             editable={canSend}
-            placeholder={settings.assistantMode === 'demo' ? 'Message Me' : canSend ? 'Message Me Home' : 'Connect Me Home to send'}
+            placeholder={settings.assistantMode === 'demo' ? 'Message Me' : setupBlocked ? 'Home setup needed' : canSend ? 'Message Me' : 'Connect Me Home to send'}
             placeholderTextColor={c.mutedForeground}
             multiline
             style={[st.input, { backgroundColor: c.card, borderColor: c.border, color: c.foreground }]}
@@ -206,6 +275,201 @@ export function ChatComposer({ conversationId, onConversationId, showBack = fals
           </Pressable>
         </View>
       </KeyboardAvoidingView>
+    </View>
+  );
+}
+
+/**
+ * Tasks for this conversation. Failed work can be retried here (it runs
+ * once more in this conversation); questions that need input are answered
+ * below in Requests.
+ */
+function NativeTaskSection({
+  tasks,
+  loading,
+  error,
+  onRefresh,
+  onRetry,
+}: {
+  tasks: import('@/lib/home-client').NativeBotTask[];
+  loading: boolean;
+  error: string | null;
+  onRefresh: () => void;
+  onRetry: (taskId: string) => void;
+}) {
+  const c = useColors();
+  const open = tasks.filter((t) => t.status === 'needs_input' || t.status === 'working' || t.status === 'ready_for_review');
+  const failed = tasks.filter((t) => t.status === 'failed');
+  if (!loading && !error && open.length === 0 && failed.length === 0) return null;
+  return (
+    <View testID="native-tasks" style={[st.error, { backgroundColor: c.muted, borderColor: c.border, flexDirection: 'column', alignItems: 'stretch', gap: 6 }]}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+        <Text style={{ flex: 1, fontFamily: F.medium, fontSize: 13, color: c.mutedForeground }}>
+          Tasks · {loading ? 'loading' : `${open.length} open · ${failed.length} failed`}
+        </Text>
+        <Pressable testID="native-tasks-refresh" accessibilityRole="button" accessibilityLabel="Refresh tasks" onPress={onRefresh} style={{ padding: 6 }}>
+          <Feather name="refresh-cw" size={15} color={c.mutedForeground} />
+        </Pressable>
+      </View>
+      {error ? (
+        <Text style={{ fontFamily: F.regular, fontSize: 13, color: c.destructive }}>{error}</Text>
+      ) : null}
+      {open.filter((t) => t.status === 'needs_input').map((t) => (
+        <Text key={t.id} style={{ fontFamily: F.regular, fontSize: 13, lineHeight: 18, color: c.foreground }}>
+          {t.title} — needs input. Answer it in Requests below.
+        </Text>
+      ))}
+      {failed.map((t) => (
+        <View key={t.id} style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+          <Text style={{ flex: 1, fontFamily: F.regular, fontSize: 13, lineHeight: 18, color: c.foreground }}>
+            {t.title} — didn&apos;t finish{t.failure ? `: ${t.failure}` : ''}.
+          </Text>
+          <Pressable testID={`native-task-retry-${t.id}`} accessibilityRole="button" accessibilityLabel={`Try ${t.title} again`} onPress={() => onRetry(t.id)} style={{ padding: 6 }}>
+            <Text style={{ fontFamily: F.medium, fontSize: 13, color: c.accent }}>Try again</Text>
+          </Pressable>
+        </View>
+      ))}
+      {open.filter((t) => t.status !== 'needs_input').map((t) => (
+        <Text key={t.id} style={{ fontFamily: F.regular, fontSize: 13, lineHeight: 18, color: c.mutedForeground }}>
+          {t.title} — {t.status.replace(/_/g, ' ')}{t.next ? ` · ${t.next}` : ''}
+        </Text>
+      ))}
+    </View>
+  );
+}
+
+/**
+ * Your requests inbox: things Me is waiting on you for, across your chats.
+ * Approve or deny each request explicitly, and answer questions directly —
+ * these decisions always go through as their own explicit action.
+ */
+function NativeRequestsSection({
+  inbox,
+  loading,
+  error,
+  busy,
+  answers,
+  onRefresh,
+  onDecide,
+  onAnswerText,
+  onRespond,
+}: {
+  inbox: import('@/lib/home-client').NativeApprovalInbox | null;
+  loading: boolean;
+  error: string | null;
+  busy: Record<string, boolean>;
+  answers: Record<string, string>;
+  onRefresh: () => void;
+  onDecide: (requestId: string, decision: import('@/lib/home-client').NativeApprovalDecision) => void;
+  onAnswerText: (questionId: string, answer: string) => void;
+  onRespond: (questionId: string) => void;
+}) {
+  const c = useColors();
+  const pending = (inbox?.requests ?? []).filter((r) => r.status === 'pending');
+  const questions = inbox?.questions ?? [];
+  if (!loading && !error && pending.length === 0 && questions.length === 0) return null;
+  return (
+    <View testID="native-requests" style={[st.error, { backgroundColor: c.muted, borderColor: c.border, flexDirection: 'column', alignItems: 'stretch', gap: 10 }]}>
+      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+        <Text style={{ flex: 1, fontFamily: F.medium, fontSize: 13, color: c.mutedForeground }}>
+          Requests · {loading ? 'loading' : `${pending.length + questions.length} waiting on you`}
+        </Text>
+        <Pressable testID="native-requests-refresh" accessibilityRole="button" accessibilityLabel="Refresh requests" onPress={onRefresh} style={{ padding: 6 }}>
+          <Feather name="refresh-cw" size={15} color={c.mutedForeground} />
+        </Pressable>
+      </View>
+      {error ? (
+        <Text style={{ fontFamily: F.regular, fontSize: 13, color: c.destructive }}>{error}</Text>
+      ) : null}
+      {pending.map((request) => {
+        const bot = request.botId ?? request.action?.botId ?? 'Me';
+        const tool = request.toolRef ?? request.action?.toolRef ?? 'something';
+        const what = `${request.effect ?? request.action?.effect ?? 'use'} · ${request.scope ?? request.action?.scope ?? ''}`.trim();
+        const detailSource = request.preview ?? request.action?.args;
+        const detail = detailSource === undefined || detailSource === null
+          ? null
+          : JSON.stringify(maskApprovalArgs(request.toolRef ?? request.action?.toolRef ?? '', detailSource), null, 2);
+        const isTaskPolicy = request.action?.policy?.source === 'task';
+        const isBusy = !!busy[request.id];
+        return (
+          <View key={request.id} testID={`native-request-${request.id}`} style={{ gap: 8 }}>
+            <Text style={{ fontFamily: F.medium, fontSize: 14, color: c.foreground }}>
+              {bot} asks to use {tool}
+            </Text>
+            <Text style={{ fontFamily: F.regular, fontSize: 13, color: c.mutedForeground }}>{what}</Text>
+            {detail ? (
+              <Text style={{ fontFamily: F.mono, fontSize: 11, color: c.mutedForeground }}>{detail.slice(0, 600)}</Text>
+            ) : null}
+            <View style={{ flexDirection: 'row', gap: 8, flexWrap: 'wrap' }}>
+              <Pressable
+                testID={`native-approve-once-${request.id}`}
+                accessibilityRole="button"
+                accessibilityLabel={`Allow ${tool} this once`}
+                disabled={isBusy}
+                onPress={() => onDecide(request.id, 'allow_once')}
+                style={{ paddingVertical: 8, paddingHorizontal: 12, borderRadius: 10, backgroundColor: c.accent, opacity: isBusy ? 0.5 : 1 }}
+              >
+                <Text style={{ fontFamily: F.medium, fontSize: 13, color: c.accentForeground }}>Allow once</Text>
+              </Pressable>
+              {isTaskPolicy ? null : (
+                <Pressable
+                  testID={`native-approve-always-${request.id}`}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Always allow ${tool}`}
+                  disabled={isBusy}
+                  onPress={() => onDecide(request.id, 'allow_always')}
+                  style={{ paddingVertical: 8, paddingHorizontal: 12, borderRadius: 10, borderWidth: 1, borderColor: c.border, opacity: isBusy ? 0.5 : 1 }}
+                >
+                  <Text style={{ fontFamily: F.medium, fontSize: 13, color: c.foreground }}>Always allow this</Text>
+                </Pressable>
+              )}
+              <Pressable
+                testID={`native-deny-${request.id}`}
+                accessibilityRole="button"
+                accessibilityLabel={`Deny ${tool}`}
+                disabled={isBusy}
+                onPress={() => onDecide(request.id, 'deny')}
+                style={{ paddingVertical: 8, paddingHorizontal: 12, borderRadius: 10, borderWidth: 1, borderColor: c.border, opacity: isBusy ? 0.5 : 1 }}
+              >
+                <Text style={{ fontFamily: F.medium, fontSize: 13, color: c.destructive }}>Deny</Text>
+              </Pressable>
+            </View>
+          </View>
+        );
+      })}
+      {questions.map((question) => {
+        const draft = answers[question.id] ?? '';
+        const isBusy = !!busy[question.id];
+        return (
+          <View key={question.id} testID={`native-question-${question.id}`} style={{ gap: 8 }}>
+            <Text style={{ fontFamily: F.medium, fontSize: 14, color: c.foreground }}>{question.botId}</Text>
+            <Text style={{ fontFamily: F.regular, fontSize: 13, lineHeight: 18, color: c.foreground }}>{question.question}</Text>
+            {question.why ? (
+              <Text style={{ fontFamily: F.regular, fontSize: 13, color: c.mutedForeground }}>{question.why}</Text>
+            ) : null}
+            <TextInput
+              testID={`native-answer-${question.id}`}
+              value={draft}
+              onChangeText={(answer) => onAnswerText(question.id, answer)}
+              placeholder="Your answer"
+              placeholderTextColor={c.mutedForeground}
+              multiline
+              editable={!isBusy}
+              style={{ borderWidth: 1, borderColor: c.border, borderRadius: 10, padding: 10, fontFamily: F.regular, fontSize: 14, color: c.foreground, backgroundColor: c.background }}
+            />
+            <Pressable
+              testID={`native-send-answer-${question.id}`}
+              accessibilityRole="button"
+              accessibilityLabel="Send answer"
+              disabled={isBusy || !draft.trim()}
+              onPress={() => onRespond(question.id)}
+              style={{ alignSelf: 'flex-start', paddingVertical: 8, paddingHorizontal: 12, borderRadius: 10, backgroundColor: c.accent, opacity: isBusy || !draft.trim() ? 0.5 : 1 }}
+            >
+              <Text style={{ fontFamily: F.medium, fontSize: 13, color: c.accentForeground }}>Send answer</Text>
+            </Pressable>
+          </View>
+        );
+      })}
     </View>
   );
 }
