@@ -19,7 +19,9 @@ origin-locked endpoints (backend hints never move credentials;
 setup paste, R7 browser-fill masking with target descriptors, and the F9
 one-time home-activation ticket mint (account auth, B7) with ephemeral
 generation-fenced operator handoff (review: late arrivals never publish).
-Implemented locally (not shipped; all changes uncommitted). Verified
+Implemented on review branch `feat/home-agent-foundation`
+(committed/pushed; draft PR #1 pending review/checks). No merge to
+protected `main`; no deployed release. Verified
 (finals, see `backend-server/docs/final-validation.md`):
 `npm test` **86 pass / 0 fail**, `npm run test:real` **2 pass / 0 fail**
 (pairing lifecycle incl. the B7 mint → home-operator activate → discovery →
