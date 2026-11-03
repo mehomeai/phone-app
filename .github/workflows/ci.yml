@@ -27,3 +27,69 @@ jobs:
         run: python3 scripts/check_repository.py
       - name: Check whitespace
         run: git show --format= --check HEAD
+
+  # Portable unit/fixture tests. Always run: zero runtime dependencies, no
+  # sibling checkouts, no devices, no tunnels.
+  unit-tests:
+    name: Portable client tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@5c79832639c874aef5db836a6f0ef7f26540b45 # v6.1.0
+        with:
+          node-version: "24.18.0"
+      - name: Run portable unit tests
+        run: npm test
+
+  # Real-services lifecycle (H1 home + B1 backend + real client) is
+  # MANUAL ONLY via workflow_dispatch, and it tests whatever is on the
+  # siblings' default branches at that moment. Sibling B3/F3/H5 features
+  # are still uncommitted, so this job MUST NOT be read as validating
+  # unmerged work: a coordinated merge of all repos is required before any
+  # release claim. Missing siblings fail the job with an explicit message
+  # (never a silent pass or skip-as-success).
+  real-services-manual:
+    name: Real-services integration (manual)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Check out phone-app
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: phone-app
+      - name: Check out infra-server sibling (default branch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mehomeai/infra-server
+          persist-credentials: false
+          path: infra-server
+      - name: Check out backend-server sibling (default branch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mehomeai/backend-server
+          persist-credentials: false
+          path: backend-server
+      - name: Set up Node
+        uses: actions/setup-node@5c79832639c874aef5db836a6f0ef7f26540b45 # v6.1.0
+        with:
+          node-version: "24.18.0"
+      - name: Verify sibling checkouts present
+        run: |
+          test -f infra-server/src/server.mjs || { echo "missing sibling checkout: infra-server/src/server.mjs (coordinated merge required)"; exit 1; }
+          test -f backend-server/src/server.mjs || { echo "missing sibling checkout: backend-server/src/server.mjs (coordinated merge required)"; exit 1; }
+      - name: Install backend dependencies
+        run: npm ci --no-audit --no-fund
+        working-directory: backend-server
+      - name: Run real-services suite against sibling checkouts
+        run: npm run test:real
+        working-directory: phone-app
+        env:
+          ME_REAL_HOME_SRC: ${{ github.workspace }}/infra-server/src/server.mjs
+          ME_REAL_BACKEND_SRC: ${{ github.workspace }}/backend-server/src/server.mjs
