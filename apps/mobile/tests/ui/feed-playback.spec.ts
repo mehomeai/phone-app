@@ -13,7 +13,8 @@ import { expect, test } from '@playwright/test';
 test('plays the redirected bridge clip in the mobile feed preview', async ({ page }) => {
   const cdnResponses: number[] = [];
   page.on('response', (response) => {
-    if (new URL(response.url()).hostname === 'dn710703.ca.archive.org') {
+    const { hostname } = new URL(response.url());
+    if (hostname === 'archive.org' || hostname.endsWith('.archive.org')) {
       cdnResponses.push(response.status());
     }
   });
