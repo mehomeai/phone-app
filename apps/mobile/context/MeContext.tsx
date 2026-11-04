@@ -20,10 +20,36 @@ import {
   randomUuidV4,
   reconcileOnEnrollmentChange,
   scopeToken,
+  describeUpstreamSetupNeeded,
+  resolveAppSelection,
   selectRedirectUri,
   stampLinkScope,
   verifyEndpointIdentity,
   visibleConversations,
+} from '@/lib/home-client';
+import {
+  createUpstreamNative,
+  dropUpstreamNativeFor,
+  resetUpstreamNativeScope,
+  upstreamNativeScope,
+} from '@/lib/upstream-native';
+import type {
+  ChannelBinding,
+  NativeApprovalDecision,
+  NativeApprovalInbox,
+  NativeBot,
+  NativeBotTask,
+  NativeTranscriptMessage,
+} from '@/lib/home-client';
+import {
+  mergeLinkMetadata,
+  NativeConversationController,
+  ChannelSingleflight,
+  DecisionGate,
+  isNativeWorkPending,
+  reconcilePendingSends,
+  runNativeWatch,
+  toDisplayMessages,
 } from '@/lib/home-client';
 import type {
   ActivationHandoff,
@@ -37,6 +63,9 @@ import type {
   MintActivationTicketInput,
   PairedHomeClient,
   TaskView,
+  UpstreamCapability,
+  UpstreamExecutionSelection,
+  RequestedUpstreamMode,
 } from '@/lib/home-client';
 import { HomeClientError } from '../../../src/errors.ts';
 import type { Conversation, Message, Profile, Settings } from '@/lib/types';
@@ -46,10 +75,13 @@ const KEY = 'me-demo-state-v1';
 const HOME_LINKS_KEY = 'me-home-links-v1';
 
 interface HomeLink {
-  /** Home-side conversation id (home-authoritative). */
+  /** Home-side conversation id (home-authoritative). In FULL native mode
+   * this is the upstream channel id; in legacy mode the /v1 conversation id. */
   homeId: string;
   /** Last client request_key for retry dedupe (survives restart). */
   requestKey?: string;
+  /** FULL native mode: the upstream Bot this channel talks to. */
+  upstreamAgentId?: string;
   /** Full authenticated scope stamp (F4). Links without a complete stamp
    * are legacy/unscoped and never trusted for display. */
   homeOwner?: string;
@@ -178,6 +210,46 @@ interface Ctx extends Persisted {
   notifications: NotificationState;
   enableNotifications: () => Promise<boolean>;
   disableNotifications: () => Promise<void>;
+  /** FULL upstream native-REST mode (Task D). Null = home reports nothing. */
+  upstreamCapability: UpstreamCapability | null;
+  /** Requested owner: 'full' default (advertised full home => full/setup-needed;
+   * resolved old homes without capability fields stay legacy compat). */
+  requestedUpstreamMode: RequestedUpstreamMode;
+  setRequestedUpstreamMode: (mode: RequestedUpstreamMode) => void;
+  /** Accessible upstream bot roster (FULL mode; null until refreshed). */
+  upstreamBots: NativeBot[] | null;
+  upstreamBotsLoading: boolean;
+  upstreamBotsError: string | null;
+  refreshUpstreamBots: () => Promise<void>;
+  /** True when the conversation is bound to an upstream native channel. */
+  isNativeConversation: (convId: string | null) => boolean;
+  /** Native upstream tasks per local conversation (verified /api/tasks). */
+  nativeTasksByConv: Record<string, NativeBotTask[]>;
+  nativeTasksLoading: Record<string, boolean>;
+  nativeTasksError: Record<string, string>;
+  refreshNativeTasks: (convId: string) => Promise<void>;
+  /** POST /api/tasks/:id/again (failed turn runs once more in its conversation). */
+  retryNativeTask: (taskId: string) => Promise<void>;
+  /** Personal native inbox across the user's chats (verified GET /api/approvals). */
+  nativeApprovals: NativeApprovalInbox | null;
+  nativeApprovalsLoading: boolean;
+  nativeApprovalsError: string | null;
+  /** Per-request busy guard: double-tap never fires a second decision. */
+  nativeApprovalsBusy: Record<string, boolean>;
+  refreshNativeApprovals: () => Promise<void>;
+  /** Explicit allow/deny (verified POST decision; never a chat-reply bypass). */
+  decideNativeApproval: (requestId: string, decision: NativeApprovalDecision) => Promise<void>;
+  /** Draft answers for native questions, keyed by question id. */
+  nativeAnswers: Record<string, string>;
+  setNativeAnswer: (questionId: string, answer: string) => void;
+  /** Explicit question answer (verified POST respond). */
+  respondNativeQuestion: (questionId: string) => Promise<void>;
+  /** Bounded foreground watch state per conversation ('watching' | 'stale'). */
+  nativeWatchState: Record<string, 'watching' | 'stale'>;
+  /** Honest derived selection: FULL requested but incomplete home => 'setup-needed' (never silent legacy). */
+  upstreamSelection: UpstreamExecutionSelection;
+  /** Operator-facing setup message when `upstreamSelection === 'setup-needed'`, else null. */
+  upstreamSetupMessage: string | null;
   /** Fenced tap routing: fetch the verified task + conversation, return the
    * local conversation id to open (fixed Chat route), or null to stay put. */
   openTaskFromNotification: (taskId: string) => Promise<string | null>;
@@ -247,6 +319,9 @@ export function MeProvider({ children }: { children: ReactNode }) {
   const [typing, setTyping] = useState<Record<string, boolean>>({});
   const [chatErrors, setChatErrors] = useState<Record<string, string>>({});
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected');
+  useEffect(() => {
+    connectionStatusRef.current = connectionStatus;
+  }, [connectionStatus]);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [enrollment, setEnrollment] = useState<EnrollmentSummary | null>(null);
   const [backend, setBackend] = useState<BackendState>({ backendUrl: '', memberHomes: [], presence: {}, backendError: null });
@@ -291,6 +366,22 @@ export function MeProvider({ children }: { children: ReactNode }) {
   const startupVerificationStarted = useRef(false);
   const [attempt, setAttempt] = useState(0);
   const timers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  /**
+   * Pending native sends keyed by idempotency UUID (offline/response-loss
+   * outbox + accepted-but-unanswered overlay). `accepted` marks a 202 (or
+   * timeout-unknown) POST the home may already hold — flush never resends
+   * those (no forced resend of accepted work; same-key manual retry stays
+   * idempotent server-side). `echoed` marks a server user-echo sighting.
+   */
+  const nativeOutboxRef = useRef<Record<string, {
+    localId: string; channelId: string; agentId: string; text: string; scopeKey: string;
+    accepted: boolean; echoed?: boolean;
+  }>>({});
+  /** Last seen server user-message ids per conversation (echo baseline). */
+  const lastServerUserIdsRef = useRef<Record<string, Set<string>>>({});
+  /** Last opened conversation for foreground/reconnect reconciliation. */
+  const lastOpenRef = useRef<{ localId: string; channelId?: string; agentId?: string } | null>(null);
+  const connectionStatusRef = useRef<ConnectionStatus>('disconnected');
   const pollers = useRef(new Map<string, { cancelled: boolean }>());
   const replyCount = useRef(0);
   const deletedConversationIds = useRef(new Set<string>());
@@ -308,6 +399,49 @@ export function MeProvider({ children }: { children: ReactNode }) {
   });
   const notifDedupe = useRef(new NotificationDedupe());
   const notifEpoch = useRef(0);
+  /** FULL upstream capability report (Task D). Null until the home reports OPTIONAL fields. */
+  const [upstreamCapability, setUpstreamCapability] = useState<UpstreamCapability | null>(null);
+  /**
+   * True once a capability fetch COMPLETED for the current pairing (success
+   * or honest failure). Distinguishes "old home that never reports fields"
+   * (explicit legacy compat) from "not yet asked" (setup-needed for new
+   * work, never silent legacy).
+   */
+  const [capabilityResolved, setCapabilityResolved] = useState(false);
+  /** Requested owner: 'full' default; resolved old homes stay legacy compat. */
+  const [requestedUpstreamMode, setRequestedUpstreamMode] = useState<RequestedUpstreamMode>('full');
+  /** FULL native bot roster (Task D native REST). Null until refreshed. */
+  const [upstreamBots, setUpstreamBots] = useState<NativeBot[] | null>(null);
+  const [upstreamBotsLoading, setUpstreamBotsLoading] = useState(false);
+  const [upstreamBotsError, setUpstreamBotsError] = useState<string | null>(null);
+  /** Native upstream tasks per local conversation (verified /api/tasks). */
+  const [nativeTasksByConv, setNativeTasksByConv] = useState<Record<string, NativeBotTask[]>>({});
+  const [nativeTasksLoading, setNativeTasksLoading] = useState<Record<string, boolean>>({});
+  const [nativeTasksError, setNativeTasksError] = useState<Record<string, string>>({});
+  /** Personal native approvals inbox (verified GET /api/approvals). */
+  const [nativeApprovals, setNativeApprovals] = useState<NativeApprovalInbox | null>(null);
+  const [nativeApprovalsLoading, setNativeApprovalsLoading] = useState(false);
+  const [nativeApprovalsError, setNativeApprovalsError] = useState<string | null>(null);
+  const [nativeApprovalsBusy, setNativeApprovalsBusy] = useState<Record<string, boolean>>({});
+  const [nativeAnswers, setNativeAnswers] = useState<Record<string, string>>({});
+  const [nativeWatchState, setNativeWatchState] = useState<Record<string, 'watching' | 'stale'>>({});
+  /** Transient channel-creation dedup (per scope + conversation). */
+  const channelSingleflightRef = useRef(new ChannelSingleflight());
+  /** Watch epochs: bumping stops the matching foreground watch. */
+  const nativeWatchEpochRef = useRef<Record<string, number>>({});
+  const nativeApprovalsRef = useRef<NativeApprovalInbox | null>(null);
+  nativeApprovalsRef.current = nativeApprovals;
+  const nativeAnswersRef = useRef<Record<string, string>>({});
+  const decisionGateRef = useRef(new DecisionGate());
+  const nativeTasksByConvRef = useRef<Record<string, NativeBotTask[]>>({});
+  nativeTasksByConvRef.current = nativeTasksByConv;
+  const requestedUpstreamModeRef = useRef<RequestedUpstreamMode>('full');
+  requestedUpstreamModeRef.current = requestedUpstreamMode;
+  const upstreamCapabilityRef = useRef<UpstreamCapability | null>(null);
+  upstreamCapabilityRef.current = upstreamCapability;
+  const capabilityResolvedRef = useRef(false);
+  capabilityResolvedRef.current = capabilityResolved;
+  const NATIVE_OUTBOX_KEY = 'me-native-outbox-v1';
   const clearNotificationsForScope = useCallback((scopeKey: string | null) => {
     if (scopeKey) notifDedupe.current.clearScope(scopeKey);
     else notifDedupe.current.clearAll();
@@ -391,6 +525,52 @@ export function MeProvider({ children }: { children: ReactNode }) {
         pollers.current.delete(key);
       }
     }
+    // FULL native (Task D): drop cached upstream channels for the same ids.
+    // The home stays source authority; the next sync re-resolves from it.
+    dropUpstreamNativeFor(droppedLocalIds);
+    // Drop transient singleflight entries and stop foreground watches: a
+    // deleted conversation never publishes, and a later resend starts fresh.
+    for (const id of droppedLocalIds) {
+      channelSingleflightRef.current.drop(id);
+      stopNativeWatch(id);
+    }
+    // Drop native task views and pending outbox entries for the same ids;
+    // a deleted conversation never replays a stale key under any identity.
+    setNativeTasksByConv((current) => {
+      const next = { ...current };
+      for (const id of dropped) delete next[id];
+      return next;
+    });
+    setNativeTasksLoading((current) => {
+      const next = { ...current };
+      for (const id of dropped) delete next[id];
+      return next;
+    });
+    setNativeTasksError((current) => {
+      const next = { ...current };
+      for (const id of dropped) delete next[id];
+      return next;
+    });
+    const outbox = nativeOutboxRef.current;
+    if (Object.values(outbox).some((entry) => dropped.has(entry.localId))) {
+      const next: typeof outbox = {};
+      for (const [externalId, entry] of Object.entries(outbox)) {
+        if (!dropped.has(entry.localId)) next[externalId] = entry;
+      }
+      nativeOutboxRef.current = next;
+      persistNativeOutbox();
+    }
+    if (lastOpenRef.current && dropped.has(lastOpenRef.current.localId)) {
+      lastOpenRef.current = null;
+    }
+    const lastIds = lastServerUserIdsRef.current;
+    if (Object.keys(lastIds).some((id) => dropped.has(id))) {
+      const nextLast: typeof lastIds = {};
+      for (const [id, ids] of Object.entries(lastIds)) {
+        if (!dropped.has(id)) nextLast[id] = ids;
+      }
+      lastServerUserIdsRef.current = nextLast;
+    }
     setState((current) => {
       const links = { ...current.homeLinks };
       for (const id of dropped) delete links[id];
@@ -447,10 +627,27 @@ export function MeProvider({ children }: { children: ReactNode }) {
     setStatus('loading');
     (async () => {
       try {
-        const [raw, linksRaw] = await Promise.all([
+        const [raw, linksRaw, outboxRaw] = await Promise.all([
           AsyncStorage.getItem(KEY),
           AsyncStorage.getItem(HOME_LINKS_KEY),
+          AsyncStorage.getItem(NATIVE_OUTBOX_KEY),
         ]);
+        // Parse the native outbox now; scope-validate it below once the
+        // credential tuple is known (previous-pairing entries are dropped,
+        // never replayed under a new family).
+        let restoredOutbox: typeof nativeOutboxRef.current = {};
+        try {
+          const parsed = outboxRaw ? (JSON.parse(outboxRaw) as {
+            scopeKey?: unknown;
+            entries?: unknown;
+          }) : null;
+          if (parsed && typeof parsed === 'object' && parsed.entries && typeof parsed.entries === 'object') {
+            restoredOutbox = parsed.entries as typeof nativeOutboxRef.current;
+            void parsed.scopeKey;
+          }
+        } catch {
+          restoredOutbox = {};
+        }
         if (!alive) return;
         let fileLinks: Record<string, HomeLink> = {};
         try {
@@ -494,6 +691,28 @@ export function MeProvider({ children }: { children: ReactNode }) {
         );
         identityRef.current = tuple;
         identityGenerationRef.current += 1;
+        // Keep only outbox entries stamped for this exact scope.
+        const outboxScope = scopeToken(tuple);
+        const scopedEntries: typeof nativeOutboxRef.current = {};
+        for (const [externalId, entry] of Object.entries(restoredOutbox)) {
+          if (
+            entry &&
+            typeof entry === 'object' &&
+            typeof (entry as { localId?: unknown }).localId === 'string' &&
+            typeof (entry as { channelId?: unknown }).channelId === 'string' &&
+            typeof (entry as { agentId?: unknown }).agentId === 'string' &&
+            typeof (entry as { text?: unknown }).text === 'string' &&
+            (entry as { scopeKey?: unknown }).scopeKey === outboxScope
+          ) {
+            const restored = entry as (typeof nativeOutboxRef.current)[string];
+            scopedEntries[externalId] = {
+              ...restored,
+              accepted: restored.accepted === true,
+              ...(restored.echoed === true ? { echoed: true as const } : {}),
+            };
+          }
+        }
+        nativeOutboxRef.current = scopedEntries;
         setIdentityResolved(true);
         setEnrollment(summary);
         setState({ ...hydrated, conversations: sanitized.conversations, homeLinks: sanitized.links });
@@ -582,8 +801,29 @@ export function MeProvider({ children }: { children: ReactNode }) {
       setEnrollment(fresh);
       setConnectionStatus('connected');
       setConnectionError(null);
+      // FULL native mode (Task D): read the home's OPTIONAL upstream
+      // capability report now that the session is live. Absence (null) is
+      // unknown, not an error — the selection derives setup-needed honestly.
+      // A newer scope winning mid-flight drops this result. Resolution is
+      // marked complete even on honest failure so resolved old homes fall
+      // back to explicit legacy compat instead of blocking.
+      // Bind the native scope cache to the verified identity as well.
+      upstreamNativeScope().bindScope(scopeToken(tupleOf(fresh)));
+      try {
+        const fetched = await client.fetchUpstreamCapability().catch(() => null);
+        if (connectionAttempt.current !== attemptId) return;
+        setUpstreamCapability(fetched);
+        setCapabilityResolved(true);
+      } catch {
+        // Capability is additive; the connection itself already succeeded.
+        if (connectionAttempt.current === attemptId) setCapabilityResolved(true);
+      }
     } catch (error) {
       if (connectionAttempt.current !== attemptId) return;
+      // Unreachable/unpaired homes cannot confirm FULL: resolve to explicit
+      // legacy compat so queued legacy work still sends; a later successful
+      // verify refetches and upgrades to full when the home reports it.
+      setCapabilityResolved(true);
       if (error instanceof HomeClientError && error.code === 'HOME_OFFLINE') {
         setConnectionStatus('offline');
         setConnectionError('Me Home is unreachable. It may be powered off or offline; queued messages will send on reconnect.');
@@ -606,13 +846,669 @@ export function MeProvider({ children }: { children: ReactNode }) {
     void verifyHomeConnection();
   }, [status, verifyHomeConnection]);
 
-  /** Flush device-queued messages after reconnect (same request_keys, no duplicates). */
+  // -- FULL native upstream (Task D native REST, pin 6bfee78) --
+  //
+  // Upstream owns conversations/history/tasks; the phone keeps a thin cache.
+  // Routing is per-conversation: links stamped with `upstreamAgentId` use
+  // the native delivery API (channel id in `homeId`); all others use the
+  // legacy /v1 path. New sends follow the requested selection: FULL creates
+  // native channels, legacy keeps /v1, setup-needed refuses honestly.
+  // All network/cache/state work below is fenced against the immutable
+  // captured scope (P0): a logout/re-pair mid-await never publishes the OLD
+  // family's channel, cache entry, message, or state under a NEW identity.
+  const currentUpstreamSelection = useCallback(() => {
+    if (stateRef.current.settings.assistantMode === 'demo') return 'demo' as const;
+    return resolveAppSelection({
+      assistantMode: 'home',
+      requested: requestedUpstreamModeRef.current,
+      capability: upstreamCapabilityRef.current,
+      capabilityResolved: capabilityResolvedRef.current,
+    });
+  }, []);
+
+  const isNativeConversation = useCallback((convId: string | null): boolean => {
+    if (!convId) return false;
+    return (stateRef.current.homeLinks[convId]?.upstreamAgentId?.length ?? 0) > 0;
+  }, []);
+
+  /**
+   * Fence adapter over the generation + scope-token capture. `isCurrent`
+   * checks the capture against the LIVE identity (not against a stale
+   * copy), so any enroll/revoke/unpair/switch that lands mid-await fences
+   * every downstream cache write, state mutation, and follow-up request.
+   */
+  const fenceFor = useCallback((fenced: { gen: number; token: string }) => ({
+    capture: () => ({ generation: fenced.gen, scopeKey: fenced.token }),
+    isCurrent: (captured: { generation: number; scopeKey: string }) =>
+      !scopeChanged({ gen: captured.generation, token: captured.scopeKey }),
+  }), [scopeChanged]);
+
+  const nativeSleep = useCallback((ms: number) => new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  }), []);
+
+  /** Persist the native outbox (idempotent retry keys survive restart). */
+  const persistNativeOutbox = useCallback(() => {
+    const payload = JSON.stringify({
+      scopeKey: scopeToken(identityRef.current),
+      entries: nativeOutboxRef.current,
+    });
+    AsyncStorage.setItem(NATIVE_OUTBOX_KEY, payload).catch(() => {});
+  }, [NATIVE_OUTBOX_KEY]);
+
+  const refreshUpstreamBots = useCallback(async () => {
+    const { client } = getClients();
+    const fenced = captureScope();
+    const fence = fenceFor(fenced);
+    const captured = fence.capture();
+    setUpstreamBotsLoading(true);
+    setUpstreamBotsError(null);
+    try {
+      const native = createUpstreamNative(client);
+      const bots = await native.listAgents();
+      if (!fence.isCurrent(captured)) return;
+      upstreamNativeScope().noteBots(bots);
+      setUpstreamBots(bots);
+      setUpstreamBotsError(null);
+    } catch (error) {
+      if (!fence.isCurrent(captured)) return;
+      setUpstreamBotsError(errorMessage(error));
+    } finally {
+      if (fence.isCurrent(captured)) setUpstreamBotsLoading(false);
+    }
+  }, [getClients, captureScope, fenceFor]);
+
+  /**
+   * Resolve (or create) the upstream channel for a local conversation via
+   * the portable controller. Concurrent initial sends share ONE in-flight
+   * creation (per scope + conversation singleflight), so rapid parallel
+   * sends bind the SAME channel instead of creating two. Fenced before
+   * AND after every await (P0): the identity is never re-read after an
+   * await; cache writes and state mutations publish only when the
+   * ORIGINAL scope still holds.
+   */
+  const ensureUpstreamChannel = useCallback(async (
+    localId: string,
+    title: string,
+  ): Promise<ChannelBinding> => {
+    const { client } = getClients();
+    const fenced = captureScope();
+    const fence = fenceFor(fenced);
+    const captured = fence.capture();
+    const existing = stateRef.current.homeLinks[localId];
+    const controller = new NativeConversationController(
+      createUpstreamNative(client),
+      randomUuidV4,
+    );
+    const binding = await channelSingleflightRef.current.bind(
+      fenced.token,
+      localId,
+      () => controller.ensureBinding(
+        existing?.homeId && existing?.upstreamAgentId
+          ? { channelId: existing.homeId, agentId: existing.upstreamAgentId }
+          : null,
+        fence,
+      ),
+    );
+    if (!fence.isCurrent(captured) || deletedConversationIds.current.has(localId)) {
+      throw new HomeClientError(
+        'UPSTREAM_SCOPE_RESET',
+        'The scope changed during the upstream turn; the result was dropped.',
+      );
+    }
+    const scope = identityRef.current;
+    upstreamNativeScope().noteChannel(localId, {
+      id: binding.channelId,
+      name: title,
+      agentIds: [binding.agentId],
+      active: true,
+    });
+    setState((current) => ({
+      ...current,
+      homeLinks: {
+        ...current.homeLinks,
+        [localId]: mergeLinkMetadata(current.homeLinks[localId] ?? { homeId: '' }, {
+          homeId: binding.channelId,
+          upstreamAgentId: binding.agentId,
+          ...(scope
+            ? {
+                homeOwner: scope.userId,
+                homeInstallationId: scope.installationId,
+                homeDeviceId: scope.deviceId,
+                homeBaseUrl: scope.homeBaseUrl,
+              }
+            : {}),
+        }),
+      },
+    }));
+    return binding;
+  }, [getClients, captureScope, fenceFor]);
+
+  /**
+   * Publish upstream-authoritative history with the accepted-but-unanswered
+   * overlay. `receiveNative` only queues (`offerInbox`); the Intelligence
+   * echo/turn lands asynchronously, so an accepted optimistic bubble must
+   * NOT be erased merely because history is behind. Displayed messages are
+   * the server list plus pending outbox bubbles for this conversation that
+   * are neither echoed nor answered. Pending entries are keyed by
+   * idempotency UUID (never text matching — repeated same-content sends
+   * keep distinct bubbles and retire oldest-first on echo count). This is
+   * overlay UX only: the server list is never rewritten, accepted work is
+   * never force-resent, and older polls can only shrink the overlay by the
+   * new-echo count, never erase server turns.
+   */
+  const publishNativeHistory = useCallback((
+    localId: string,
+    history: NativeTranscriptMessage[],
+    answered: boolean,
+  ) => {
+    const serverUserIds = new Set<string>();
+    for (const message of history) {
+      if (message.role === 'user') serverUserIds.add(message.id);
+    }
+    const previous = lastServerUserIdsRef.current[localId];
+    let newEchoes = 0;
+    if (previous) {
+      for (const id of serverUserIds) {
+        if (!previous.has(id)) newEchoes += 1;
+      }
+    }
+    lastServerUserIdsRef.current = { ...lastServerUserIdsRef.current, [localId]: serverUserIds };
+    const entries = Object.entries(nativeOutboxRef.current).filter(
+      ([, entry]) => entry.localId === localId,
+    );
+    // Single source of truth for the overlay rules (tested in
+    // reconcilePendingSends): answered clears, otherwise oldest-first echo
+    // retirement bounded by the new-echo count, nothing without a baseline.
+    const kept = new Set(
+      reconcilePendingSends(
+        entries.map(([externalId]) => ({ externalId })),
+        { answered, newUserEchoes: newEchoes, hadBaseline: previous !== undefined },
+      ).map((entry) => entry.externalId),
+    );
+    let outboxChanged = false;
+    if (answered && entries.length > 0) {
+      // Turn completed: the server is authoritative from here.
+      const next = { ...nativeOutboxRef.current };
+      for (const [externalId] of entries) delete next[externalId];
+      nativeOutboxRef.current = next;
+      outboxChanged = true;
+    } else if (!answered) {
+      for (const [externalId, entry] of entries) {
+        if (!entry.echoed && !kept.has(externalId)) {
+          const next = { ...nativeOutboxRef.current };
+          next[externalId] = { ...next[externalId], echoed: true };
+          nativeOutboxRef.current = next;
+          outboxChanged = true;
+        }
+      }
+    }
+    if (outboxChanged) persistNativeOutbox();
+    const serverMapped: Message[] = toDisplayMessages(history, Date.now());
+    const overlay: Message[] = [];
+    for (const [externalId, entry] of Object.entries(nativeOutboxRef.current)) {
+      if (entry.localId !== localId || entry.echoed) continue;
+      overlay.push({ id: `pending-${externalId}`, role: 'user', text: entry.text, createdAt: Date.now() });
+    }
+    const scope = identityRef.current;
+    setState((current) => ({
+      ...current,
+      homeLinks: scope ? stampLinkScope(current.homeLinks, localId, scope) : current.homeLinks,
+      conversations: current.conversations.map((item) =>
+        item.id === localId ? { ...item, messages: [...serverMapped, ...overlay] } : item,
+      ),
+    }));
+    setChatError(localId, null);
+  }, [persistNativeOutbox]);
+
+  /** Hydrate a conversation from upstream-authoritative native history. */
+  const hydrateNativeConversation = useCallback(async (
+    localId: string,
+    channelId: string,
+    agentId: string,
+  ) => {
+    const { client } = getClients();
+    const fenced = captureScope();
+    const fence = fenceFor(fenced);
+    const captured = fence.capture();
+    setTyping((current) => ({ ...current, [localId]: true }));
+    try {
+      const native = createUpstreamNative(client);
+      const history = await native.getHistory(channelId, agentId);
+      if (!fence.isCurrent(captured) || deletedConversationIds.current.has(localId)) return;
+      publishNativeHistory(localId, history, false);
+    } catch (error) {
+      if (!fence.isCurrent(captured) || deletedConversationIds.current.has(localId)) return;
+      setChatError(localId, errorMessage(error));
+    } finally {
+      if (!fence.isCurrent(captured) || deletedConversationIds.current.has(localId)) return;
+      setTyping((current) => {
+        const next = { ...current };
+        delete next[localId];
+        return next;
+      });
+    }
+  }, [getClients, setChatError, captureScope, fenceFor, publishNativeHistory]);
+
+  /**
+   * Refresh verified native tasks for a conversation (fixes
+   * openConversation returning before tasks load: native questions/
+   * approvals/tasks surface without a manual revisit). Fenced like every
+   * other native call; another household member's tasks never leak (the
+   * home scopes the list per owner, the phone additionally filters by the
+   * bound channel id).
+   */
+  const refreshNativeTasks = useCallback(async (localId: string) => {
+    const { client } = getClients();
+    const link = stateRef.current.homeLinks[localId];
+    if (!link?.homeId || !link?.upstreamAgentId) return;
+    const fenced = captureScope();
+    const fence = fenceFor(fenced);
+    const captured = fence.capture();
+    const channelId = link.homeId;
+    setNativeTasksLoading((current) => ({ ...current, [localId]: true }));
+    try {
+      const native = createUpstreamNative(client);
+      const all = await native.listNativeTasks();
+      if (!fence.isCurrent(captured) || deletedConversationIds.current.has(localId)) return;
+      const mine = all.filter((task) => task.channelId === channelId);
+      setNativeTasksByConv((current) => ({ ...current, [localId]: mine }));
+      setNativeTasksError((current) => {
+        const next = { ...current };
+        delete next[localId];
+        return next;
+      });
+    } catch (error) {
+      if (!fence.isCurrent(captured) || deletedConversationIds.current.has(localId)) return;
+      setNativeTasksError((current) => ({ ...current, [localId]: errorMessage(error) }));
+    } finally {
+      if (!fence.isCurrent(captured) || deletedConversationIds.current.has(localId)) return;
+      setNativeTasksLoading((current) => {
+        const next = { ...current };
+        delete next[localId];
+        return next;
+      });
+    }
+  }, [getClients, captureScope, fenceFor]);
+
+  /**
+   * Refresh the personal native inbox (verified GET /api/approvals).
+   * Fenced: another user's requests never publish here (the home scopes
+   * per owner AND the fence drops late callbacks after any scope change).
+   */
+  const refreshNativeApprovals = useCallback(async () => {
+    const { client } = getClients();
+    const fenced = captureScope();
+    const fence = fenceFor(fenced);
+    const captured = fence.capture();
+    setNativeApprovalsLoading(true);
+    try {
+      const native = createUpstreamNative(client);
+      const inbox = await native.getNativeApprovals();
+      if (!fence.isCurrent(captured)) return;
+      setNativeApprovals(inbox);
+      setNativeApprovalsError(null);
+    } catch (error) {
+      if (!fence.isCurrent(captured)) return;
+      setNativeApprovalsError(errorMessage(error));
+    } finally {
+      if (!fence.isCurrent(captured)) return;
+      setNativeApprovalsLoading(false);
+    }
+  }, [getClients, captureScope, fenceFor]);
+
+  /**
+   * Release exactly the captured lease: the generation-guarded gate ignores
+   * a stale release when the same id was re-acquired under a new scope, so
+   * an old finally can never unlock new work. Busy-state writes happen only
+   * when the captured scope still holds (no React writes when stale).
+   */
+  const releaseNativeDecision = useCallback((
+    id: string,
+    owner: number,
+    isCurrent: boolean,
+  ) => {
+    decisionGateRef.current.release(id, owner);
+    if (!isCurrent) return;
+    setNativeApprovalsBusy((current) => {
+      if (!(id in current)) return current;
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
+  }, []);
+
+  /**
+   * Explicit approval decision (verified POST decision). Per-request busy
+   * guard: double-tap never fires a second decision. Refreshes the inbox
+   * after (approvals.tsx calls inbox.refresh() after every decision).
+   * Client/fence capture and gate acquisition all happen inside the guarded
+   * region: a throw before acquisition leaks nothing, and a stale finally
+   * neither unlocks new work nor writes state.
+   */
+  const decideNativeApproval = useCallback(async (
+    requestId: string,
+    decision: NativeApprovalDecision,
+  ) => {
+    const { client } = getClients();
+    const fenced = captureScope();
+    const fence = fenceFor(fenced);
+    const captured = fence.capture();
+    let acquired = false;
+    try {
+      // Double-tap guard bound to this scope generation: the second tap in
+      // the same frame is refused even before the disabled button re-renders.
+      acquired = decisionGateRef.current.tryAcquire(requestId, fenced.gen);
+      if (!acquired) return;
+      setNativeApprovalsBusy((current) => ({ ...current, [requestId]: true }));
+      const native = createUpstreamNative(client);
+      await native.decideNativeApproval(requestId, decision);
+      if (!fence.isCurrent(captured)) return;
+      await refreshNativeApprovals();
+    } catch (error) {
+      if (!fence.isCurrent(captured)) return;
+      setNativeApprovalsError(errorMessage(error));
+    } finally {
+      if (acquired) releaseNativeDecision(requestId, fenced.gen, fence.isCurrent(captured));
+    }
+  }, [getClients, captureScope, fenceFor, refreshNativeApprovals, releaseNativeDecision]);
+
+  const setNativeAnswer = useCallback((questionId: string, answer: string) => {
+    nativeAnswersRef.current = { ...nativeAnswersRef.current, [questionId]: answer };
+    setNativeAnswers((current) => ({ ...current, [questionId]: answer }));
+  }, []);
+
+  /** Explicit question answer (verified POST respond with the draft text). */
+  const respondNativeQuestion = useCallback(async (questionId: string) => {
+    const { client } = getClients();
+    const fenced = captureScope();
+    const fence = fenceFor(fenced);
+    const captured = fence.capture();
+    let acquired = false;
+    try {
+      acquired = decisionGateRef.current.tryAcquire(questionId, fenced.gen);
+      if (!acquired) return;
+      const response = nativeAnswersRef.current[questionId] ?? '';
+      setNativeApprovalsBusy((current) => ({ ...current, [questionId]: true }));
+      const native = createUpstreamNative(client);
+      await native.respondNativeQuestion(questionId, response);
+      if (!fence.isCurrent(captured)) return;
+      nativeAnswersRef.current = { ...nativeAnswersRef.current };
+      delete nativeAnswersRef.current[questionId];
+      setNativeAnswers((current) => {
+        const next = { ...current };
+        delete next[questionId];
+        return next;
+      });
+      await refreshNativeApprovals();
+    } catch (error) {
+      if (!fence.isCurrent(captured)) return;
+      setNativeApprovalsError(errorMessage(error));
+    } finally {
+      if (acquired) releaseNativeDecision(questionId, fenced.gen, fence.isCurrent(captured));
+    }
+  }, [getClients, captureScope, fenceFor, refreshNativeApprovals, releaseNativeDecision]);
+
+  /** Fenced raw history read (no state writes): watch terminal checks. */
+  const peekNativeHistory = useCallback(async (
+    channelId: string,
+    agentId: string,
+    fence: { isCurrent: (captured: { generation: number; scopeKey: string }) => boolean },
+    captured: { generation: number; scopeKey: string },
+  ) => {
+    const { client } = getClients();
+    try {
+      const native = createUpstreamNative(client);
+      const history = await native.getHistory(channelId, agentId);
+      if (!fence.isCurrent(captured)) return null;
+      return history;
+    } catch {
+      // Transient: the watch keeps going on last-known state.
+      return null;
+    }
+  }, [getClients]);
+
+  const stopNativeWatch = useCallback((localId: string) => {
+    nativeWatchEpochRef.current = {
+      ...nativeWatchEpochRef.current,
+      [localId]: (nativeWatchEpochRef.current[localId] ?? 0) + 1,
+    };
+    setNativeWatchState((current) => {
+      if (!(localId in current)) return current;
+      const next = { ...current };
+      delete next[localId];
+      return next;
+    });
+  }, []);
+
+  const stopAllNativeWatches = useCallback(() => {
+    const next: Record<string, number> = {};
+    for (const localId of Object.keys(nativeWatchEpochRef.current)) {
+      next[localId] = (nativeWatchEpochRef.current[localId] ?? 0) + 1;
+    }
+    nativeWatchEpochRef.current = next;
+    setNativeWatchState({});
+  }, []);
+
+  /**
+   * One bounded foreground watch per conversation (review item 3): re-reads
+   * actual history/tasks/inbox with backoff until the work is terminal,
+   * then settles; ceiling sets an honest manual-refresh state. Exactly one
+   * runner per conversation (epoch-guarded); per-send watchers are never
+   * created. No model spend — reads only. Stops on scope change, delete,
+   * logout, and background.
+   */
+  const startNativeWatch = useCallback((localId: string, channelId: string, agentId: string) => {
+    const epoch = (nativeWatchEpochRef.current[localId] ?? 0) + 1;
+    nativeWatchEpochRef.current = { ...nativeWatchEpochRef.current, [localId]: epoch };
+    setNativeWatchState((current) => ({ ...current, [localId]: 'watching' }));
+    const fenced = captureScope();
+    const fence = fenceFor(fenced);
+    const watchFence = {
+      capture: () => ({ generation: fenced.gen, scopeKey: fenced.token }),
+      isCurrent: (captured: { generation: number; scopeKey: string }) =>
+        !scopeChanged({ gen: captured.generation, token: captured.scopeKey }) &&
+        !deletedConversationIds.current.has(localId) &&
+        nativeWatchEpochRef.current[localId] === epoch,
+    };
+    void runNativeWatch({
+      fence: watchFence,
+      wait: nativeSleep,
+      poll: async () => {
+        await hydrateNativeConversation(localId, channelId, agentId);
+        await refreshNativeTasks(localId);
+        await refreshNativeApprovals();
+        const capturedPoll = watchFence.capture();
+        const history = await peekNativeHistory(channelId, agentId, watchFence, capturedPoll);
+        const tasks = (nativeTasksByConvRef.current[localId] ?? []).filter(
+          (task) => task.channelId === channelId,
+        );
+        const inbox = nativeApprovalsRef.current;
+        const pendingApprovals = (inbox?.requests ?? []).filter(
+          (request) => request.status === 'pending',
+        ).length;
+        const questions = (inbox?.questions ?? []).length;
+        return !isNativeWorkPending({
+          history: history ?? [],
+          tasks,
+          pendingApprovalCount: pendingApprovals,
+          unansweredQuestionCount: questions,
+        });
+      },
+      onStale: () => {
+        stopNativeWatch(localId);
+      },
+    }).then((outcome) => {
+      if (outcome === 'ceiling') {
+        setNativeWatchState((current) => ({ ...current, [localId]: 'stale' }));
+      } else if (outcome === 'settled') {
+        stopNativeWatch(localId);
+      }
+    });
+  }, [
+    captureScope,
+    fenceFor,
+    nativeSleep,
+    scopeChanged,
+    hydrateNativeConversation,
+    refreshNativeTasks,
+    refreshNativeApprovals,
+    peekNativeHistory,
+    stopNativeWatch,
+  ]);
+
+  /** POST /api/tasks/:id/again for a native task, then refresh its conversation. */
+  const retryNativeTask = useCallback(async (taskId: string) => {
+    const { client } = getClients();
+    const fenced = captureScope();
+    const fence = fenceFor(fenced);
+    const captured = fence.capture();
+    const convId = Object.entries(nativeTasksByConvRef.current).find(([, tasks]) =>
+      tasks.some((task) => task.id === taskId),
+    )?.[0];
+    try {
+      const native = createUpstreamNative(client);
+      await native.retryNativeTask(taskId);
+      if (!fence.isCurrent(captured)) return;
+      if (convId) await refreshNativeTasks(convId);
+    } catch (error) {
+      if (!fence.isCurrent(captured)) return;
+      if (convId) {
+        setNativeTasksError((current) => ({ ...current, [convId]: errorMessage(error) }));
+      }
+    }
+  }, [getClients, captureScope, fenceFor, refreshNativeTasks]);
+
+  /**
+   * POST-202-then-poll send via the portable controller: the single
+   * immediate GET after a 202 normally has no assistant yet, so poll
+   * history (bounded, scope-fenced) until the answer lands. Response-loss
+   * and offline sends keep the SAME externalId in the outbox — never a
+   * duplicate, never a "not run" claim that cannot be known.
+   */
+  const requestNativeSend = useCallback(async (
+    localId: string,
+    channelId: string,
+    agentId: string,
+    text: string,
+    externalId: string,
+  ) => {
+    const { client } = getClients();
+    const fenced = captureScope();
+    const fence = fenceFor(fenced);
+    const captured = fence.capture();
+    setTyping((current) => ({ ...current, [localId]: true }));
+    setChatError(localId, null);
+    const outboxScopeKey = fenced.token;
+    try {
+      const controller = new NativeConversationController(
+        createUpstreamNative(client),
+        randomUuidV4,
+      );
+      // Remember BEFORE the POST: a kill between accept and response still retries idempotently.
+      nativeOutboxRef.current = {
+        ...nativeOutboxRef.current,
+        [externalId]: { localId, channelId, agentId, text, scopeKey: outboxScopeKey, accepted: false },
+      };
+      persistNativeOutbox();
+      const result = await controller.sendAndSync({
+        channelId,
+        agentId,
+        text,
+        requestKey: externalId,
+        fence,
+        sleep: nativeSleep,
+      });
+      if (!fence.isCurrent(captured) || deletedConversationIds.current.has(localId)) return;
+      // Accepted (202 or polled): the home may hold it, so mark accepted —
+      // flush never resends accepted work, and the entry now only feeds the
+      // overlay until the turn completes. Removal happens in publish on
+      // answered/echoed, never on mere acceptance.
+      nativeOutboxRef.current = {
+        ...nativeOutboxRef.current,
+        [externalId]: { localId, channelId, agentId, text, scopeKey: outboxScopeKey, accepted: true },
+      };
+      persistNativeOutbox();
+      // Publish with the overlay: the accepted bubble stays visible until
+      // the server echo/turn actually lands (history is often behind here).
+      publishNativeHistory(localId, result.history, result.answered);
+      // The polled answer may still be pending server-side; refresh tasks
+      // and the inbox so native questions/approvals surface without a
+      // manual revisit. Long research (>12s) continues under ONE bounded
+      // foreground watch per conversation (no per-send watchers).
+      void refreshNativeTasks(localId);
+      void refreshNativeApprovals();
+      if (!result.answered) {
+        startNativeWatch(localId, channelId, agentId);
+      }
+    } catch (error) {
+      if (!fence.isCurrent(captured) || deletedConversationIds.current.has(localId)) return;
+      if (error instanceof HomeClientError && error.code === 'UPSTREAM_SCOPE_RESET') return;
+      if (
+        error instanceof HomeClientError &&
+        (error.code === 'HOME_OFFLINE' || error.code === 'TIMEOUT')
+      ) {
+        setConnectionStatus((current) => (current === 'connected' ? 'offline' : current));
+        setChatError(
+          localId,
+          'Delivery not confirmed — it may or may not have run upstream. Retry sends with the same ID so it will not duplicate.',
+        );
+      } else {
+        setChatError(localId, errorMessage(error));
+        setConnectionStatus((current) => (current === 'connected' ? current : 'error'));
+      }
+    } finally {
+      if (!fence.isCurrent(captured) || deletedConversationIds.current.has(localId)) return;
+      setTyping((current) => {
+        const next = { ...current };
+        delete next[localId];
+        return next;
+      });
+    }
+  }, [getClients, setChatError, captureScope, fenceFor, nativeSleep, persistNativeOutbox, refreshNativeTasks, refreshNativeApprovals, startNativeWatch]);
+
+  /**
+   * Flush device-queued messages after reconnect (same request_keys, no
+   * duplicates). Routes by link kind (P0): native links resend through the
+   * native delivery API with the SAME idempotency UUID (the legacy
+   * client.sendMessage path would target the wrong engine with the wrong
+   * id), then re-hydrate; native links without pending outbox entries
+   * still re-hydrate to reconcile answers missed while offline. Legacy
+   * links keep the existing cache-queue flush.
+   */
   const flushQueued = useCallback(async () => {
     const { client } = getClients();
     const fenced = captureScope();
+    const fence = fenceFor(fenced);
+    const captured = fence.capture();
     const links = stateRef.current.homeLinks;
     for (const [localId, link] of Object.entries(links)) {
-      if (scopeChanged(fenced) || deletedConversationIds.current.has(localId)) return;
+      if (!fence.isCurrent(captured) || deletedConversationIds.current.has(localId)) return;
+      if (link.upstreamAgentId && link.homeId) {
+        const channelId = link.homeId;
+        const agentId = link.upstreamAgentId;
+        try {
+          // Resend only entries never confirmed accepted: accepted work is
+          // never force-resent (the server dedupes by externalId, but the
+          // phone does not re-fire turns on its own).
+          const pending = Object.entries(nativeOutboxRef.current).filter(
+            ([, entry]) => entry.localId === localId && !entry.accepted,
+          );
+          for (const [externalId, entry] of pending) {
+            if (!fence.isCurrent(captured) || deletedConversationIds.current.has(localId)) return;
+            try {
+              await requestNativeSend(localId, channelId, agentId, entry.text, externalId);
+            } catch {
+              // Stays in the outbox; the next reconnect or manual retry handles it.
+            }
+          }
+          // Reconcile answers missed while offline even with nothing pending.
+          await hydrateNativeConversation(localId, channelId, agentId);
+        } catch {
+          // Per-conversation best effort; connection state already reflects reachability.
+        }
+        continue;
+      }
       try {
         const cached = await client.readCachedConversation(link.homeId);
         if (scopeChanged(fenced) || deletedConversationIds.current.has(localId)) return;
@@ -644,7 +1540,12 @@ export function MeProvider({ children }: { children: ReactNode }) {
         // Per-conversation best effort; connection state already reflects reachability.
       }
     }
-  }, [getClients, setChatError, captureScope, scopeChanged]);
+    // One inbox refresh after reconnect (fenced): decisions/answers made on
+    // another device appear without reopening each conversation.
+    if (fence.isCurrent(captured)) {
+      await refreshNativeApprovals();
+    }
+  }, [getClients, setChatError, captureScope, scopeChanged, fenceFor, requestNativeSend, hydrateNativeConversation, refreshNativeApprovals]);
 
   useEffect(() => {
     if (connectionStatus === 'connected') {
@@ -695,14 +1596,40 @@ export function MeProvider({ children }: { children: ReactNode }) {
     }
   }, [getClients, setChatError, captureScope, scopeChanged]);
 
+
+
   const openConversation = useCallback((id: string) => {
     const conv = stateRef.current.conversations.find((item) => item.id === id);
-    const homeId = stateRef.current.homeLinks[id]?.homeId;
+    const link = stateRef.current.homeLinks[id];
+    const homeId = link?.homeId;
     if (conv?.assistantMode === 'home' && homeId && connectionStatus !== 'disconnected') {
+      // Track for foreground/reconnect reconciliation (native vs legacy kind).
+      lastOpenRef.current = link?.upstreamAgentId
+        ? { localId: id, channelId: homeId, agentId: link.upstreamAgentId }
+        : { localId: id };
+      if (link?.upstreamAgentId) {
+        // Native open hydrates history AND tasks AND the inbox together
+        // (P0: previously returned before tasks, so questions/approvals
+        // never appeared). A cached pending state restarts the single
+        // bounded foreground watch (it settles fast when already terminal).
+        void hydrateNativeConversation(id, homeId, link.upstreamAgentId);
+        void refreshNativeTasks(id);
+        void refreshNativeApprovals();
+        const cachedTasks = nativeTasksByConvRef.current[id] ?? [];
+        const hasOpenWork = cachedTasks.some((task) =>
+          task.status === 'needs_input' || task.status === 'working' ||
+          task.status === 'ready_for_review');
+        const messages = conv.messages;
+        const awaitingReply = messages.length > 0 && messages[messages.length - 1].role === 'user';
+        if (hasOpenWork || awaitingReply) {
+          startNativeWatch(id, homeId, link.upstreamAgentId);
+        }
+        return;
+      }
       void pullHomeConversation(id, homeId);
       void refreshTasksRef.current(id);
     }
-  }, [connectionStatus, pullHomeConversation]);
+  }, [connectionStatus, pullHomeConversation, hydrateNativeConversation, refreshNativeTasks, refreshNativeApprovals, startNativeWatch]);
 
   const requestHomeSend = useCallback(async (localId: string, homeId: string, text: string, requestKey: string) => {
     const { client } = getClients();
@@ -805,26 +1732,59 @@ export function MeProvider({ children }: { children: ReactNode }) {
       title: conversation.messages.length === 0 ? clean.slice(0, 42) || conversation.title : conversation.title,
       messages: [...conversation.messages, userMessage],
     };
+    // P0: preserve the FULL existing link (mergeLinkMetadata) — dropping
+    // `upstreamAgentId` here made every turn allocate a NEW upstream channel.
+    // A fresh UUID is minted per message; retries reuse the stored key exactly.
     setState((current) => ({
       ...current,
       conversations: [updated, ...current.conversations.filter((item) => item.id !== targetId)],
       homeLinks: {
         ...current.homeLinks,
-        [targetId]: {
+        [targetId]: mergeLinkMetadata(current.homeLinks[targetId] ?? { homeId: '' }, {
           homeId: current.homeLinks[targetId]?.homeId ?? '',
           requestKey,
           ...scopeStamp,
-        },
+        }),
       },
     }));
+    // FULL native mode sends through the upstream delivery API (channel id
+    // in the link); legacy mode uses /v1. Setup-needed refuses honestly.
+    const selection = currentUpstreamSelection();
+    if (selection === 'setup-needed') {
+      setChatError(
+        targetId,
+        describeUpstreamSetupNeeded(upstreamCapabilityRef.current),
+      );
+      return targetId;
+    }
+    const useNative = selection === 'full';
+    // Fence the whole closure (P0): a scope change mid-create/mid-POST must
+    // not publish under the new identity. The send closure catch is fenced
+    // too — stale errors never surface after a switch.
+    const fenced = captureScope();
+    const fence = fenceFor(fenced);
+    const capturedSend = fence.capture();
     void (async () => {
       try {
+        if (useNative) {
+          const { channelId, agentId } = await ensureUpstreamChannel(targetId, updated.title);
+          if (!fence.isCurrent(capturedSend) || deletedConversationIds.current.has(targetId)) return;
+          const link = stateRef.current.homeLinks[targetId];
+          await requestNativeSend(
+            targetId,
+            channelId,
+            agentId,
+            clean,
+            link?.requestKey ?? requestKey,
+          );
+          return;
+        }
         const { client } = getClients();
         let link = stateRef.current.homeLinks[targetId];
         if (!link?.homeId) {
           const created = await client.createConversation(updated.title);
-          link = { homeId: created.id, requestKey };
-          if (deletedConversationIds.current.has(targetId)) return;
+          link = mergeLinkMetadata(link, { homeId: created.id, requestKey });
+          if (!fence.isCurrent(capturedSend) || deletedConversationIds.current.has(targetId)) return;
           setState((current) => ({
             ...current,
             homeLinks: { ...current.homeLinks, [targetId]: link! },
@@ -832,12 +1792,12 @@ export function MeProvider({ children }: { children: ReactNode }) {
         }
         await requestHomeSend(targetId, link.homeId, clean, link.requestKey ?? requestKey);
       } catch (error) {
-        if (deletedConversationIds.current.has(targetId)) return;
+        if (!fence.isCurrent(capturedSend) || deletedConversationIds.current.has(targetId)) return;
         setChatError(targetId, errorMessage(error));
       }
     })();
     return targetId;
-  }, [getClients, requestHomeSend, setChatError]);
+  }, [getClients, requestHomeSend, requestNativeSend, ensureUpstreamChannel, currentUpstreamSelection, setChatError, captureScope, fenceFor]);
 
   const retryMessage = useCallback((convId: string) => {
     const conversation = stateRef.current.conversations.find((item) => item.id === convId);
@@ -850,8 +1810,19 @@ export function MeProvider({ children }: { children: ReactNode }) {
       void sendMessage(convId, lastUser.text);
       return;
     }
+    if (link.upstreamAgentId) {
+      // Retry reuses the EXACT stored idempotency key (outbox entry when a
+      // previous attempt never confirmed), never a fresh send.
+      const outboxEntry = Object.entries(nativeOutboxRef.current).find(
+        ([, entry]) => entry.localId === convId,
+      );
+      const retryKey = outboxEntry?.[0] ?? link.requestKey ?? randomUuidV4();
+      const retryText = outboxEntry?.[1].text ?? lastUser.text;
+      void requestNativeSend(convId, link.homeId, link.upstreamAgentId, retryText, retryKey);
+      return;
+    }
     void requestHomeSend(convId, link.homeId, lastUser.text, link.requestKey ?? randomUuidV4());
-  }, [requestHomeSend, sendMessage]);
+  }, [requestHomeSend, requestNativeSend, sendMessage]);
 
   /**
    * Stop any bounded task poller (conversation deleted, logout, unmount).
@@ -946,6 +1917,30 @@ export function MeProvider({ children }: { children: ReactNode }) {
       clearNotificationsForScope(prevScopeKey);
       identityRef.current = next;
       identityGenerationRef.current += 1;
+      // FULL upstream (Task D): a new pairing is a new scope — fence late
+      // native callbacks and clear the roster/channel cache. The native
+      // outbox belongs to the old scope and never moves across identities.
+      resetUpstreamNativeScope('enroll');
+      nativeOutboxRef.current = {};
+      lastServerUserIdsRef.current = {};
+      persistNativeOutbox();
+      stopAllNativeWatches();
+      decisionGateRef.current = new DecisionGate();
+      setNativeApprovals(null);
+      setNativeApprovalsError(null);
+      setNativeApprovalsBusy({});
+      setNativeAnswers({});
+      nativeAnswersRef.current = {};
+      setNativeWatchState({});
+      upstreamNativeScope().bindScope(scopeToken(next));
+      // Capability is per-pairing and unknown until the new home reports it.
+      setUpstreamCapability(null);
+      setCapabilityResolved(false);
+      setNativeTasksByConv({});
+      setNativeTasksLoading({});
+      setNativeTasksError({});
+      setUpstreamBots(null);
+      setUpstreamBotsError(null);
       setIdentityResolved(true);
       setEnrollment(summary);
       setState((current) => ({
@@ -954,6 +1949,18 @@ export function MeProvider({ children }: { children: ReactNode }) {
       }));
       setConnectionStatus('connected');
       setConnectionError(null);
+      // Capability is per-pairing: read the OPTIONAL report now that the
+      // fresh enrollment is live (absence = unknown, never an error).
+      // Resolution completes either way so old homes get legacy compat.
+      try {
+        const fetched = await client.fetchUpstreamCapability().catch(() => null);
+        if (connectionAttempt.current !== attemptId) return false;
+        setUpstreamCapability(fetched);
+        setCapabilityResolved(true);
+      } catch {
+        // Additive only; enrollment already succeeded.
+        if (connectionAttempt.current === attemptId) setCapabilityResolved(true);
+      }
       return true;
     } catch (error) {
       if (connectionAttempt.current !== attemptId) return false;
@@ -997,6 +2004,28 @@ export function MeProvider({ children }: { children: ReactNode }) {
       clearNotificationsForScope(scopeToken(prev));
       identityRef.current = null;
       identityGenerationRef.current += 1;
+      // FULL native (Task D): revocation ends the scope — fence late
+      // native callbacks and clear the roster/channel cache.
+      resetUpstreamNativeScope('revoke');
+      nativeOutboxRef.current = {};
+      lastServerUserIdsRef.current = {};
+      persistNativeOutbox();
+      stopAllNativeWatches();
+      decisionGateRef.current = new DecisionGate();
+      setUpstreamCapability(null);
+      setCapabilityResolved(false);
+      setNativeApprovals(null);
+      setNativeApprovalsError(null);
+      setNativeApprovalsBusy({});
+      setNativeAnswers({});
+      nativeAnswersRef.current = {};
+      setNativeWatchState({});
+      setNativeTasksByConv({});
+      setNativeTasksLoading({});
+      setNativeTasksError({});
+      setUpstreamBots(null);
+      setUpstreamBotsError(null);
+      setRequestedUpstreamMode('full');
       setIdentityResolved(true);
       const { droppedLocalIds } = reconcileOnEnrollmentChange(
         prev,
@@ -1025,6 +2054,28 @@ export function MeProvider({ children }: { children: ReactNode }) {
       clearNotificationsForScope(scopeToken(prev));
       identityRef.current = null;
       identityGenerationRef.current += 1;
+      // FULL native (Task D): unpairing ends the scope — fence late
+      // native callbacks and clear the roster/channel cache.
+      resetUpstreamNativeScope('unpair');
+      nativeOutboxRef.current = {};
+      lastServerUserIdsRef.current = {};
+      persistNativeOutbox();
+      stopAllNativeWatches();
+      decisionGateRef.current = new DecisionGate();
+      setUpstreamCapability(null);
+      setCapabilityResolved(false);
+      setNativeApprovals(null);
+      setNativeApprovalsError(null);
+      setNativeApprovalsBusy({});
+      setNativeAnswers({});
+      nativeAnswersRef.current = {};
+      setNativeWatchState({});
+      setNativeTasksByConv({});
+      setNativeTasksLoading({});
+      setNativeTasksError({});
+      setUpstreamBots(null);
+      setUpstreamBotsError(null);
+      setRequestedUpstreamMode('full');
       setIdentityResolved(true);
       const { droppedLocalIds } = reconcileOnEnrollmentChange(
         prev,
@@ -1126,6 +2177,28 @@ export function MeProvider({ children }: { children: ReactNode }) {
       clearNotificationsForScope(scopeToken(prev));
       identityRef.current = null;
       identityGenerationRef.current += 1;
+      // FULL upstream (Task D): the cloud account changed — the old home
+      // scope ends here. Fence late native callbacks, clear the cache.
+      resetUpstreamNativeScope('account-switch');
+      nativeOutboxRef.current = {};
+      lastServerUserIdsRef.current = {};
+      persistNativeOutbox();
+      stopAllNativeWatches();
+      decisionGateRef.current = new DecisionGate();
+      setUpstreamCapability(null);
+      setCapabilityResolved(false);
+      setNativeApprovals(null);
+      setNativeApprovalsError(null);
+      setNativeApprovalsBusy({});
+      setNativeAnswers({});
+      nativeAnswersRef.current = {};
+      setNativeWatchState({});
+      setNativeTasksByConv({});
+      setNativeTasksLoading({});
+      setNativeTasksError({});
+      setUpstreamBots(null);
+      setUpstreamBotsError(null);
+      setRequestedUpstreamMode('full');
       setIdentityResolved(true);
       const { droppedLocalIds } = reconcileOnEnrollmentChange(
         prev,
@@ -1580,9 +2653,17 @@ export function MeProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const active = pollers.current;
     const subscription = AppState.addEventListener('change', (next) => {
-      // Foreground sync: re-verify the live endpoint when returning.
+      // Foreground sync: re-verify the live endpoint when returning, then
+      // reconcile the last-opened conversation so answers that landed while
+      // the app was closed actually appear (no local mock completion).
       if (next === 'active' && stateRef.current.settings.assistantMode === 'home') {
-        void verifyHomeConnectionRef.current();
+        void verifyHomeConnectionRef.current().finally(() => {
+          void reconcileForegroundRef.current();
+        });
+      } else if (next === 'background') {
+        // No background CPU: stop foreground watches; foreground return
+        // restarts them when work is still pending.
+        stopAllNativeWatchesRef.current();
       }
     });
     return () => {
@@ -1597,6 +2678,52 @@ export function MeProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     verifyHomeConnectionRef.current = verifyHomeConnection;
   }, [verifyHomeConnection]);
+
+  const stopAllNativeWatchesRef = useRef(() => {});
+
+  useEffect(() => {
+    stopAllNativeWatchesRef.current = stopAllNativeWatches;
+  }, [stopAllNativeWatches]);
+
+  const reconcileForegroundRef = useRef(() => Promise.resolve());
+
+  useEffect(() => {
+    reconcileForegroundRef.current = async () => {
+      const last = lastOpenRef.current;
+      if (!last || connectionStatusRef.current !== 'connected') return;
+      const conv = stateRef.current.conversations.find((item) => item.id === last.localId);
+      if (!conv || conv.assistantMode !== 'home') return;
+      if (last.channelId && last.agentId) {
+        await hydrateNativeConversation(last.localId, last.channelId, last.agentId);
+        await refreshNativeTasks(last.localId);
+        await refreshNativeApprovals();
+        // Restart the bounded watch when the refreshed state still shows
+        // open work (research that finished while away settles immediately).
+        const fenced = captureScope();
+        if (scopeChanged(fenced)) return;
+        const tasks = (nativeTasksByConvRef.current[last.localId] ?? []).filter(
+          (task) => task.channelId === last.channelId,
+        );
+        const history = stateRef.current.conversations.find(
+          (item) => item.id === last.localId,
+        )?.messages ?? [];
+        const hasUserText = history.some((m) => m.role === 'user');
+        const openWork = tasks.some((task) =>
+          task.status === 'needs_input' || task.status === 'working' ||
+          task.status === 'ready_for_review');
+        const approvalsOpen = (nativeApprovalsRef.current?.requests ?? []).some(
+          (request) => request.status === 'pending',
+        );
+        if ((hasUserText && openWork) || approvalsOpen) {
+          startNativeWatch(last.localId, last.channelId, last.agentId);
+        }
+      } else {
+        const legacyHomeId = stateRef.current.homeLinks[last.localId]?.homeId;
+        if (!legacyHomeId) return;
+        await pullHomeConversation(last.localId, legacyHomeId);
+      }
+    };
+  }, [hydrateNativeConversation, refreshNativeTasks, refreshNativeApprovals, pullHomeConversation, captureScope, scopeChanged, startNativeWatch]);
 
   const findTaskConv = useCallback((taskId: string): string | null => {
     for (const [convId, tasks] of Object.entries(tasksByConv)) {
@@ -1977,7 +3104,22 @@ export function MeProvider({ children }: { children: ReactNode }) {
     }
   }, [captureScope, scopeChanged, getClients, setChatError]);
 
-  const value: Ctx = useMemo(() => ({
+  const value: Ctx = useMemo(() => {
+    // FULL native upstream (Task D): honest derived selection via the
+    // actual app decision. Requested FULL + not-yet-resolved => setup-needed
+    // (never silent legacy); resolved old homes without capability fields
+    // stay legacy compat; demo stays demo.
+    const upstreamSelection = resolveAppSelection({
+      assistantMode: state.settings.assistantMode,
+      requested: requestedUpstreamMode,
+      capability: upstreamCapability,
+      capabilityResolved,
+    });
+    const upstreamSetupMessage =
+      upstreamSelection === 'setup-needed'
+        ? describeUpstreamSetupNeeded(upstreamCapability)
+        : null;
+    return {
     ...state,
     status,
     saveError,
@@ -2034,6 +3176,9 @@ export function MeProvider({ children }: { children: ReactNode }) {
       deletedConversationIds.current.add(id);
       clearTimer(id);
       stopPollersFor(id);
+      // FULL native (Task D): drop the cached upstream channel for the
+      // deleted conversation (home stays source authority).
+      dropUpstreamNativeFor([id]);
       // Prune task ids for this conversation so task-keyed artifact state
       // does not linger after the conversation is gone (F6 privacy).
       const taskIdsForConv = (tasksByConvRef.current[id] ?? [])
@@ -2088,6 +3233,34 @@ export function MeProvider({ children }: { children: ReactNode }) {
     notifications,
     enableNotifications,
     disableNotifications,
+    upstreamCapability,
+    requestedUpstreamMode,
+    setRequestedUpstreamMode: (mode) => {
+      requestedUpstreamModeRef.current = mode;
+      setRequestedUpstreamMode(mode);
+    },
+    upstreamSelection,
+    upstreamSetupMessage,
+    upstreamBots,
+    upstreamBotsLoading,
+    upstreamBotsError,
+    refreshUpstreamBots,
+    isNativeConversation,
+    nativeTasksByConv,
+    nativeTasksLoading,
+    nativeTasksError,
+    refreshNativeTasks,
+    retryNativeTask,
+    nativeApprovals,
+    nativeApprovalsLoading,
+    nativeApprovalsError,
+    nativeApprovalsBusy,
+    refreshNativeApprovals,
+    decideNativeApproval,
+    nativeAnswers,
+    setNativeAnswer,
+    respondNativeQuestion,
+    nativeWatchState,
     openTaskFromNotification,
     configureBackend,
     clearBackend,
@@ -2142,9 +3315,32 @@ export function MeProvider({ children }: { children: ReactNode }) {
         await client.enterDemoMode().catch(() => {});
         await coordinator.clearBackend().catch(() => {});
         await accountManager.logout().catch(() => {});
-        identityRef.current = null;
-        identityGenerationRef.current += 1;
-        setIdentityResolved(true);
+      identityRef.current = null;
+      identityGenerationRef.current += 1;
+      // FULL native (Task D): demo reset clears everything — fence late
+      // native callbacks and clear the roster/channel cache.
+      resetUpstreamNativeScope('reset-demo');
+      nativeOutboxRef.current = {};
+      lastServerUserIdsRef.current = {};
+      persistNativeOutbox();
+      stopAllNativeWatches();
+      decisionGateRef.current = new DecisionGate();
+      setCapabilityResolved(false);
+      setNativeApprovals(null);
+      setNativeApprovalsError(null);
+      setNativeApprovalsBusy({});
+      setNativeAnswers({});
+      nativeAnswersRef.current = {};
+      setNativeWatchState({});
+      setNativeTasksByConv({});
+      setNativeTasksLoading({});
+      setNativeTasksError({});
+      // FULL upstream capability is per-pairing; a demo reset clears it.
+      setUpstreamCapability(null);
+      setUpstreamBots(null);
+      setUpstreamBotsError(null);
+      setRequestedUpstreamMode('full');
+      setIdentityResolved(true);
         setEnrollment(null);
         setAccount({ status: 'signed-out', accountId: null, issuer: null, backendUrl: null, claims: null, error: null });
         setBackend({ backendUrl: '', memberHomes: [], presence: {}, backendError: null });
@@ -2160,12 +3356,19 @@ export function MeProvider({ children }: { children: ReactNode }) {
       }
       setState(seed());
     },
-  }), [
+  };
+  }, [
     state, status, saveError, typing, chatErrors, connectionStatus, connectionError,
     enrollment, identityResolved, backend, account, tasksByConv, tasksLoading, taskErrors, taskArtifacts,
     activeCallId, activeProfile, notifications, openConversation, sendMessage, retryMessage,
     enrollHome, enrollWithSetupJson, revokeEnrollment, useDemoMode, verifyHomeConnection,
     enableNotifications, disableNotifications, openTaskFromNotification,
+    upstreamCapability, requestedUpstreamMode, capabilityResolved,
+    upstreamBots, upstreamBotsLoading, upstreamBotsError, refreshUpstreamBots, isNativeConversation,
+    nativeTasksByConv, nativeTasksLoading, nativeTasksError, refreshNativeTasks, retryNativeTask,
+    nativeApprovals, nativeApprovalsLoading, nativeApprovalsError, nativeApprovalsBusy,
+    refreshNativeApprovals, decideNativeApproval, nativeAnswers, setNativeAnswer,
+    respondNativeQuestion, nativeWatchState,
     configureBackend, clearBackend,
     refreshAccountConfig, signInWithProvider, signOutAccount, retryAccountRefresh,
     refreshBackendHomes, joinBackendHome, selectBackendHome, mintActivationTicket, refreshTasks,

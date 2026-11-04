@@ -25,7 +25,9 @@ export type HomeClientErrorCode =
   | 'AUTH_FAILED'
   | 'NOTIFICATIONS_DISABLED'
   | 'REGISTRATION_LIMIT'
-  | 'PAIRING_REQUIRED';
+  | 'PAIRING_REQUIRED'
+  | 'UPSTREAM_NOT_CONFIGURED'
+  | 'UPSTREAM_SCOPE_RESET';
 
 export class HomeClientError extends Error {
   readonly code: HomeClientErrorCode;

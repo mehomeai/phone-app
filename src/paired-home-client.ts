@@ -38,6 +38,10 @@ import type {
   TaskView,
   UserId,
 } from './types.ts';
+import {
+  parseUpstreamCapability,
+} from './upstream-capability.ts';
+import type { UpstreamCapability } from './upstream-capability.ts';
 
 export const ENROLLMENT_STORAGE_KEY = 'me.home.enrollment.v1';
 export const CACHE_PREFIX = 'me.home.cache.v1.';
@@ -944,6 +948,72 @@ export class PairedHomeClient {
     }
   }
 
+  /**
+   * Read the home's OPTIONAL upstream capability report (Task A additive
+   * fields on `GET /v1/me`: `{agentMode, fullConfigured, needsSetup,
+   * missing?}`). Returns null when the home reports nothing (unknown — not
+   * an error) or when the shape is malformed (never guessed). The phone
+   * treats null + requested FULL as `setup-needed`, never silent legacy.
+   */
+  async fetchUpstreamCapability(): Promise<UpstreamCapability | null> {
+    const enrollment = await this.requireEnrollment();
+    const response = await this.authenticatedRequest(
+      enrollment,
+      ROUTES.me,
+      { method: 'GET' },
+    );
+    return parseUpstreamCapability(response);
+  }
+
+  /**
+   * Call the pinned upstream native REST API through the paired home's own
+   * authority (`{homeBaseUrl}/api/*`).
+   *
+   * Auth is ONLY the home session bearer (`Authorization: Bearer <ht1_*>`,
+   * same as /v1/*). The upstream mobile client used a BetterAuth Cookie;
+   * the phone MUST NOT forge one — the home exchanges ht1_* server-side and
+   * asserts the mapped upstream principal. Private upstream material
+   * (license, gateway URLs, agent tokens, model keys) is never accepted
+   * here: bodies carrying those fields are refused client-side.
+   *
+   * Path rules: absolute `/api/` paths only (query allowed for
+   * `?agentId=`/`?cursor=`), no `..`, no credentials. Methods: GET/POST/DELETE.
+   * Same-origin + redirect guards are the shared `request()` guards.
+   */
+  async proxyNativeApi(
+    path: string,
+    options: { method?: string; body?: Record<string, unknown> } = {},
+  ): Promise<unknown> {
+    const method = (options.method ?? 'GET').toUpperCase();
+    if (method !== 'GET' && method !== 'POST' && method !== 'DELETE') {
+      throw new HomeClientError('INVALID_INPUT', 'Unsupported upstream call.');
+    }
+    if (!path.startsWith('/api/')) {
+      throw new HomeClientError(
+        'INVALID_INPUT',
+        'Upstream calls use absolute OpenBot /api/ paths only.',
+      );
+    }
+    if (
+      path.includes('..') ||
+      path.includes('\\') ||
+      path.includes(' ') ||
+      /[\u0000-\u001f]/.test(path)
+    ) {
+      throw new HomeClientError('INVALID_INPUT', 'The upstream path is not valid.');
+    }
+    if (options.body !== undefined) {
+      assertNoPrivateUpstreamFields(options.body);
+    }
+    const enrollment = await this.requireEnrollment();
+    return this.authenticatedRequest(
+      enrollment,
+      path,
+      { method },
+      options.body,
+    );
+  }
+
   /** Revoke this device (e.g. sign out everywhere from an admin session). */
   async revokeOwnDevice(): Promise<void> {
     const enrollment = await this.requireEnrollment();
@@ -1279,6 +1349,12 @@ export class PairedHomeClient {
         // or device reads as not-found.
         return new HomeClientError('NOT_FOUND', 'Not found at this home.');
       }
+      if (path.startsWith('/api/')) {
+        // Pinned upstream native surface through the home proxy: a missing
+        // route and a missing channel both read as not-found on this home
+        // (upstream `ownedScope` refusals arrive as 400, not 404).
+        return new HomeClientError('NOT_FOUND', 'Not found at this home.');
+      }
       return new HomeClientError(
         'CONTRACT_MISMATCH',
         'The home is missing the required API route. It may run an incompatible contract version.',
@@ -1382,6 +1458,25 @@ function mapNotificationError(error: unknown): unknown {
     return error;
   }
   return error;
+}
+
+/**
+ * Defense-in-depth: the phone never holds private upstream material, so it
+ * never sends it either. Refuse bodies carrying license / gateway / agent /
+ * model secrets before they reach the network.
+ */
+const PRIVATE_UPSTREAM_FIELD_RE =
+  /^(COPILOTKIT_LICENSE_TOKEN|CPK_INTELLIGENCE_API_KEY|INTELLIGENCE_GATEWAY_WS_URL|MANAGED_AGENT_TOKEN|AGENT_TOOL_TOKEN|SUPERVISOR_TOKEN|COMPUTER_TOKEN|BETTER_AUTH_SECRET|OPENAI_API_KEY|ANTHROPIC_API_KEY|GOOGLE_API_KEY)$/;
+
+function assertNoPrivateUpstreamFields(body: Record<string, unknown>): void {
+  for (const key of Object.keys(body)) {
+    if (PRIVATE_UPSTREAM_FIELD_RE.test(key)) {
+      throw new HomeClientError(
+        'INVALID_INPUT',
+        'Private upstream credentials must never reach the phone.',
+      );
+    }
+  }
 }
 
 /** Owner-scoped task reads: another household member's task is not-found. */
