@@ -50,8 +50,10 @@ test('adds and activates a household profile during setup without replacing save
   });
   expect(persisted.conversations).toEqual(originalState.conversations);
   expect(persisted.settings).toEqual(originalState.settings);
-  expect(persisted.liked).toEqual(originalState.liked);
-  expect(persisted.saved).toEqual(originalState.saved);
+  expect(persisted.liked).toEqual([]);
+  expect(persisted.saved).toEqual([]);
+  expect(persisted.clipCollectionsByProfile['household-owner']).toEqual({ liked: originalState.liked, saved: originalState.saved });
+  expect(persisted.clipCollectionsByProfile[persisted.activeProfileId]).toEqual({ liked: [], saved: [] });
 
   for (let i = 0; i < 3; i += 1) {
     await page.getByTestId('onboarding-next').click();
@@ -66,8 +68,9 @@ test('adds and activates a household profile during setup without replacing save
   expect(completedState.profiles).toHaveLength(2);
   expect(completedState.conversations).toEqual(originalState.conversations);
   expect(completedState.settings).toEqual(originalState.settings);
-  expect(completedState.liked).toEqual(originalState.liked);
-  expect(completedState.saved).toEqual(originalState.saved);
+  expect(completedState.liked).toEqual([]);
+  expect(completedState.saved).toEqual([]);
+  expect(completedState.clipCollectionsByProfile['household-owner']).toEqual({ liked: originalState.liked, saved: originalState.saved });
 
   await page.getByRole('tab', { name: 'Me' }).click();
   await page.getByTestId('me-mode-settings').click();
