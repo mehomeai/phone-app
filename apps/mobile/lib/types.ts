@@ -1,7 +1,7 @@
 export type Role = 'parent' | 'child' | 'adult';
 export interface Profile { id: string; name: string; role: Role }
 export interface Message { id: string; role: 'user' | 'assistant'; text: string; createdAt: number }
-export interface Conversation { id: string; profileId: string; title: string; messages: Message[]; assistantMode?: 'demo' | 'home' }
+export interface Conversation { id: string; profileId: string; title: string; messages: Message[]; assistantMode?: 'demo' | 'home'; createdAt?: number }
 export type ModelId = 'me-small' | 'me-balanced' | 'me-deep';
 export interface Settings {
   assistantMode: 'demo' | 'home';

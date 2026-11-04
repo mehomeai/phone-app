@@ -3,6 +3,7 @@ const path = require('node:path');
 const ts = require('typescript');
 
 const dataPath = path.resolve(__dirname, '../lib/data.ts');
+const SOURCE_TIMEOUT_MS = 15_000;
 const sourceFile = ts.createSourceFile(
   dataPath,
   fs.readFileSync(dataPath, 'utf8'),
@@ -59,59 +60,97 @@ if (invalidEntries > 0 || clips.length === 0) {
   process.exit(1);
 }
 
-async function checkSource({ id, sourceUrl }, { fetchImpl = globalThis.fetch } = {}) {
+async function checkSource(
+  { id, sourceUrl },
+  {
+    fetchImpl = globalThis.fetch,
+    log = console.log,
+    setTimeoutImpl = setTimeout,
+    clearTimeoutImpl = clearTimeout,
+  } = {},
+) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15_000);
+  let rejectTimeout;
+  const timeoutPromise = new Promise((_, reject) => {
+    rejectTimeout = reject;
+  });
+  const timeout = setTimeoutImpl(
+    () => {
+      const timeoutError = new Error(`Request timed out after ${SOURCE_TIMEOUT_MS} ms`);
+      controller.abort(timeoutError);
+      rejectTimeout(timeoutError);
+    },
+    SOURCE_TIMEOUT_MS,
+  );
 
   try {
-    const response = await fetchImpl(sourceUrl, {
-      method: 'GET',
-      redirect: 'manual',
-      headers: {
-        Range: 'bytes=0-0',
-        'User-Agent': 'MeClipSourceCheck/1.0',
-      },
-      signal: controller.signal,
-    });
+    const request = (async () => {
+      const response = await fetchImpl(sourceUrl, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: {
+          Range: 'bytes=0-0',
+          'User-Agent': 'MeClipSourceCheck/1.0',
+        },
+        signal: controller.signal,
+      });
 
-    if (response.body) {
-      await response.body.cancel().catch(() => {});
-    }
+      if (response.body) {
+        await response.body.cancel().catch(() => {});
+      }
 
-    if (response.status >= 300 && response.status < 400) {
-      const location = response.headers.get('location');
-      const redirectDetail = location ? ` (Location: ${location})` : '';
-      return `${id}: unexpected redirect, HTTP ${response.status}${redirectDetail} — ${sourceUrl}`;
-    }
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get('location');
+        const redirectDetail = location ? ` (Location: ${location})` : '';
+        return `${id}: unexpected redirect, HTTP ${response.status}${redirectDetail} — ${sourceUrl}`;
+      }
 
-    if (!response.ok) {
-      return `${id}: HTTP ${response.status} ${response.statusText} — ${sourceUrl}`;
-    }
+      if (!response.ok) {
+        return `${id}: HTTP ${response.status} ${response.statusText} — ${sourceUrl}`;
+      }
 
-    console.log(`OK ${id}: ${sourceUrl}`);
-    return undefined;
+      log(`OK ${id}: ${sourceUrl}`);
+      return undefined;
+    })();
+    return await Promise.race([request, timeoutPromise]);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     return `${id}: request failed (${detail}) — ${sourceUrl}`;
   } finally {
-    clearTimeout(timeout);
+    clearTimeoutImpl(timeout);
   }
 }
 
-async function main() {
-  console.log(`Checking ${clips.length} clip source URL(s)...`);
-  const failures = (await Promise.all(clips.map(checkSource))).filter(Boolean);
+async function runChecks({
+  clipList = clips,
+  fetchImpl = globalThis.fetch,
+  log = console.log,
+  error = console.error,
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
+} = {}) {
+  log(`Checking ${clipList.length} clip source URL(s)...`);
+  const failures = (await Promise.all(
+    clipList.map((clip) =>
+      checkSource(clip, { fetchImpl, log, setTimeoutImpl, clearTimeoutImpl }),
+    ),
+  )).filter(Boolean);
 
   if (failures.length > 0) {
-    console.error(`\n${failures.length} clip source check(s) failed:`);
+    error(`\n${failures.length} clip source check(s) failed:`);
     for (const failure of failures) {
-      console.error(`- ${failure}`);
+      error(`- ${failure}`);
     }
-    process.exitCode = 1;
-    return;
+    return { failures, exitCode: 1 };
   }
 
-  console.log('All clip source URLs are reachable without redirects.');
+  log('All clip source URLs are reachable without redirects.');
+  return { failures, exitCode: 0 };
+}
+
+async function main() {
+  const result = await runChecks();
+  process.exitCode = result.exitCode;
 }
 
 if (require.main === module) {
@@ -121,4 +160,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { checkSource };
+module.exports = { checkSource, runChecks };

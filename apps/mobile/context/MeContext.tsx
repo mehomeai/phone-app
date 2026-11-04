@@ -97,6 +97,7 @@ interface Persisted {
   settings: Settings;
   liked: string[];
   saved: string[];
+  clipCollectionsByProfile: Record<string, { liked: string[]; saved: string[] }>;
   onboardingCompleted: boolean;
   homeLinks: Record<string, HomeLink>;
 }
@@ -145,6 +146,7 @@ const seed = (): Persisted => ({
   settings: SEED_SETTINGS,
   liked: [],
   saved: [],
+  clipCollectionsByProfile: { [SEED_PROFILES[0].id]: { liked: [], saved: [] } },
   onboardingCompleted: false,
   homeLinks: {},
 });
@@ -190,6 +192,13 @@ function assertValidSavedConversations(value: unknown): asserts value is Convers
     }
     seenIds.add(conversation.id);
   }
+}
+
+/** Sanitize a saved clip-id list (Nov 4 per-profile clip collections):
+ * only unique, non-empty string ids survive hydration. */
+function savedClipIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0))];
 }
 
 /**
@@ -758,6 +767,38 @@ export function MeProvider({ children }: { children: ReactNode }) {
             conversations: parsed.conversations !== undefined ? parsed.conversations : [],
             homeLinks: { ...fileLinks, ...(parsed.homeLinks ?? {}) },
             onboardingCompleted: typeof parsed.onboardingCompleted === 'boolean' ? parsed.onboardingCompleted : true,
+          };
+          // Nov 4 per-profile clip collections: legacy flat liked/saved
+          // belong to the profile active when they were saved; scoped
+          // collections saved by newer builds win per profile. The flat
+          // liked/saved fields always mirror the active profile's
+          // collection so existing readers keep working.
+          const effectiveProfiles = Array.isArray(hydrated.profiles) && hydrated.profiles.length > 0 ? hydrated.profiles : base.profiles;
+          const effectiveActiveId = effectiveProfiles.some((profile) => profile.id === hydrated.activeProfileId)
+            ? hydrated.activeProfileId
+            : effectiveProfiles[0].id;
+          const legacyCollections = { liked: savedClipIds(parsed.liked), saved: savedClipIds(parsed.saved) };
+          const savedCollections = parsed.clipCollectionsByProfile && typeof parsed.clipCollectionsByProfile === 'object' && !Array.isArray(parsed.clipCollectionsByProfile)
+            ? (parsed.clipCollectionsByProfile as Record<string, unknown>)
+            : null;
+          const clipCollectionsByProfile: Persisted['clipCollectionsByProfile'] = {};
+          for (const profile of effectiveProfiles) {
+            const candidate = savedCollections ? savedCollections[profile.id] : undefined;
+            const scoped = candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+              ? (candidate as { liked?: unknown; saved?: unknown })
+              : undefined;
+            clipCollectionsByProfile[profile.id] = { liked: savedClipIds(scoped?.liked), saved: savedClipIds(scoped?.saved) };
+          }
+          if (!savedCollections || !Object.prototype.hasOwnProperty.call(savedCollections, effectiveActiveId)) {
+            clipCollectionsByProfile[effectiveActiveId] = legacyCollections;
+          }
+          const activeCollections = clipCollectionsByProfile[effectiveActiveId] ?? legacyCollections;
+          hydrated = {
+            ...hydrated,
+            profiles: effectiveProfiles,
+            liked: activeCollections.liked,
+            saved: activeCollections.saved,
+            clipCollectionsByProfile,
           };
         }
         // Load the credential tuple BEFORE first publication, then sanitize
@@ -3253,11 +3294,26 @@ export function MeProvider({ children }: { children: ReactNode }) {
     // Profile switching stays functional for demo/household UX but can never
     // impersonate in home mode: home display is bound to the authenticated
     // paired identity via visibleChats, not to the selected profile.
-    setActiveProfile: (id) => setState((current) => ({ ...current, activeProfileId: id })),
+    // Switching profiles swaps the flat liked/saved to the newly active
+    // profile's clip collection (Nov 4 per-profile collections).
+    setActiveProfile: (id) => setState((current) => {
+      const activeCollections = current.clipCollectionsByProfile[id] ?? { liked: [], saved: [] };
+      return {
+        ...current,
+        activeProfileId: id,
+        liked: activeCollections.liked,
+        saved: activeCollections.saved,
+        clipCollectionsByProfile: { ...current.clipCollectionsByProfile, [id]: activeCollections },
+      };
+    }),
     updateProfile: (id, patch) => setState((current) => ({ ...current, profiles: current.profiles.map((profile) => (profile.id === id ? { ...profile, ...patch } : profile)) })),
     addProfile: (profile) => {
       const id = uid();
-      setState((current) => ({ ...current, profiles: [...current.profiles, { ...profile, id }] }));
+      setState((current) => ({
+        ...current,
+        profiles: [...current.profiles, { ...profile, id }],
+        clipCollectionsByProfile: { ...current.clipCollectionsByProfile, [id]: { liked: [], saved: [] } },
+      }));
       return id;
     },
     addSetupProfile: (profile) => {
@@ -3268,32 +3324,58 @@ export function MeProvider({ children }: { children: ReactNode }) {
       );
       if (existing) {
         if (current.activeProfileId !== existing.id) {
-          setState((state) => ({ ...state, activeProfileId: existing.id }));
+          setState((state) => {
+            const activeCollections = state.clipCollectionsByProfile[existing.id] ?? { liked: [], saved: [] };
+            return {
+              ...state,
+              activeProfileId: existing.id,
+              liked: activeCollections.liked,
+              saved: activeCollections.saved,
+              clipCollectionsByProfile: { ...state.clipCollectionsByProfile, [existing.id]: activeCollections },
+            };
+          });
         }
         return existing.id;
       }
       const created = { ...profile, name: profile.name.trim(), id: uid() };
-      setState((state) => ({ ...state, profiles: [...state.profiles, created], activeProfileId: created.id }));
+      setState((state) => ({
+        ...state,
+        profiles: [...state.profiles, created],
+        activeProfileId: created.id,
+        liked: [],
+        saved: [],
+        clipCollectionsByProfile: { ...state.clipCollectionsByProfile, [created.id]: { liked: [], saved: [] } },
+      }));
       return created.id;
     },
     removeProfile: (id) =>
       setState((current) => {
         if (current.profiles.length <= 1) return current;
         const profiles = current.profiles.filter((profile) => profile.id !== id);
+        const clipCollectionsByProfile = { ...current.clipCollectionsByProfile };
+        delete clipCollectionsByProfile[id];
+        const removedWasActive = current.activeProfileId === id;
+        const nextActiveId = removedWasActive ? profiles[0].id : current.activeProfileId;
+        const activeCollections = clipCollectionsByProfile[nextActiveId] ?? { liked: [], saved: [] };
         return {
           ...current,
           profiles,
           // Demo profiles own demo conversations only; home conversations
           // are bound to the paired identity and stay (server-authoritative).
           conversations: current.conversations.filter((conversation) => conversation.profileId !== id || (conversation.assistantMode ?? 'demo') === 'home'),
-          activeProfileId: current.activeProfileId === id ? profiles[0].id : current.activeProfileId,
+          activeProfileId: nextActiveId,
+          liked: removedWasActive ? activeCollections.liked : current.liked,
+          saved: removedWasActive ? activeCollections.saved : current.saved,
+          clipCollectionsByProfile: removedWasActive
+            ? { ...clipCollectionsByProfile, [nextActiveId]: activeCollections }
+            : clipCollectionsByProfile,
         };
       }),
     createConversation: (title = 'New conversation') => {
       const id = uid();
       setState((current) => ({
         ...current,
-        conversations: [{ id, profileId: current.activeProfileId, title, messages: [], assistantMode: current.settings.assistantMode }, ...current.conversations],
+        conversations: [{ id, profileId: current.activeProfileId, title, messages: [], assistantMode: current.settings.assistantMode, createdAt: Date.now() }, ...current.conversations],
       }));
       return id;
     },
@@ -3422,8 +3504,26 @@ export function MeProvider({ children }: { children: ReactNode }) {
       if (patch.assistantMode === 'demo') void useDemoMode();
       else setState((current) => ({ ...current, settings: { ...current.settings, ...patch } }));
     },
-    toggleLike: (id) => setState((current) => ({ ...current, liked: current.liked.includes(id) ? current.liked.filter((item) => item !== id) : [...current.liked, id] })),
-    toggleSave: (id) => setState((current) => ({ ...current, saved: current.saved.includes(id) ? current.saved.filter((item) => item !== id) : [...current.saved, id] })),
+    // Toggles write through to the active profile's clip collection so
+    // the flat fields and the scoped map never drift (Nov 4).
+    toggleLike: (id) => setState((current) => {
+      const liked = current.liked.includes(id) ? current.liked.filter((item) => item !== id) : [...current.liked, id];
+      const activeCollections = current.clipCollectionsByProfile[current.activeProfileId] ?? { liked: current.liked, saved: current.saved };
+      return {
+        ...current,
+        liked,
+        clipCollectionsByProfile: { ...current.clipCollectionsByProfile, [current.activeProfileId]: { ...activeCollections, liked } },
+      };
+    }),
+    toggleSave: (id) => setState((current) => {
+      const saved = current.saved.includes(id) ? current.saved.filter((item) => item !== id) : [...current.saved, id];
+      const activeCollections = current.clipCollectionsByProfile[current.activeProfileId] ?? { liked: current.liked, saved: current.saved };
+      return {
+        ...current,
+        saved,
+        clipCollectionsByProfile: { ...current.clipCollectionsByProfile, [current.activeProfileId]: { ...activeCollections, saved } },
+      };
+    }),
     setOnboardingCompleted: async (completed) => {
       const nextState = { ...stateRef.current, onboardingCompleted: completed };
       try {
