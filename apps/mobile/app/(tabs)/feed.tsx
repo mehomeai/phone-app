@@ -15,6 +15,7 @@ import type { FeedItem } from '@/lib/types';
 const MIX_STEPS = [0, 25, 50, 75, 100];
 const DESCRIPTION_PREVIEW_LENGTH = 90;
 const FEED_LOAD_TIMEOUT_MS = 15_000;
+const FEED_STREAM_STALL_TIMEOUT_MS = 10_000;
 const mixLabel = (v: number) => (v < 20 ? 'Wander widely' : v < 45 ? 'Mostly exploring' : v < 70 ? 'Balanced' : v < 90 ? 'Mostly my topics' : 'Only my topics first');
 
 export default function FeedScreen() {
@@ -86,7 +87,15 @@ function Feed() {
       ) : null}
       <View style={[st.topBar, { top: top + 8 }]} pointerEvents="box-none">
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 14 }}>
-          <Pressable testID="feed-controls" hitSlop={10} onPress={() => { tap(); setOpen(true); }}>
+          <Pressable
+            testID="feed-controls"
+            accessibilityRole="button"
+            accessibilityLabel="Open feed controls"
+            accessibilityHint="Choose learning mix and topics for your feed"
+            accessibilityState={{ expanded: open }}
+            hitSlop={10}
+            onPress={() => { tap(); setOpen(true); }}
+          >
             <Feather name="sliders" size={22} color={c.onImage} />
           </Pressable>
         </View>
@@ -110,34 +119,85 @@ function Reel({ item, height, isActive }: { item: FeedItem; height: number; isAc
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(true);
   const [showDescription, setShowDescription] = useState(false);
+  const streamStallTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const hasPlayedRef = useRef(false);
   const isLiked = liked.includes(item.id);
   const isSaved = saved.includes(item.id);
   const descriptionPreview = item.body.length > DESCRIPTION_PREVIEW_LENGTH
     ? `${item.body.slice(0, DESCRIPTION_PREVIEW_LENGTH).trimEnd()}…`
     : item.body;
 
+  // Stream-stall recovery (Nov 4 port): once a clip has actually
+  // played, a stall that lasts FEED_STREAM_STALL_TIMEOUT_MS becomes a
+  // retryable interrupted-stream error instead of a silent freeze.
+  const clearStreamStallTimer = useCallback(() => {
+    if (streamStallTimerRef.current) {
+      clearTimeout(streamStallTimerRef.current);
+      streamStallTimerRef.current = null;
+    }
+  }, []);
+  const markStreamInterrupted = useCallback(() => {
+    clearStreamStallTimer();
+    setPlayerError('This video stream was interrupted. Try again.');
+    setLoadState('error');
+    setIsPlaying(false);
+  }, [clearStreamStallTimer]);
+  const startStreamStallTimer = useCallback(() => {
+    if (!isActive) return;
+    clearStreamStallTimer();
+    streamStallTimerRef.current = setTimeout(markStreamInterrupted, FEED_STREAM_STALL_TIMEOUT_MS);
+  }, [clearStreamStallTimer, isActive, markStreamInterrupted]);
+  const handleWebStreamStall = useCallback((event: React.SyntheticEvent<HTMLVideoElement>) => {
+    if (!isActive || !hasPlayedRef.current || event.currentTarget.paused) return;
+    startStreamStallTimer();
+  }, [isActive, startStreamStallTimer]);
+  const handleWebPlaybackResume = useCallback(() => {
+    hasPlayedRef.current = true;
+    clearStreamStallTimer();
+    setLoadState('ready');
+    setPlayerError('');
+    setIsPlaying(true);
+  }, [clearStreamStallTimer]);
+
+  useEffect(() => () => clearStreamStallTimer(), [clearStreamStallTimer]);
+
   useEffect(() => {
     if (Platform.OS === 'web') return;
     const updateLoadState = (status: typeof player.status, errorMessage?: string) => {
-      if (status === 'loading') setLoadState('loading');
+      if (status === 'loading') {
+        if (hasPlayedRef.current) {
+          startStreamStallTimer();
+          return;
+        }
+        setLoadState('loading');
+      }
       if (status === 'readyToPlay') {
+        clearStreamStallTimer();
         setLoadState('ready');
         setPlayerError('');
       }
       if (status === 'error') {
+        clearStreamStallTimer();
         setLoadState('error');
         setPlayerError(errorMessage ?? '');
         setIsPlaying(false);
       }
     };
     const statusSubscription = player.addListener('statusChange', ({ status, error }) => updateLoadState(status, error?.message));
-    const playingSubscription = player.addListener('playingChange', ({ isPlaying: playing }) => setIsPlaying(playing));
+    const playingSubscription = player.addListener('playingChange', ({ isPlaying: playing }) => {
+      if (playing) {
+        hasPlayedRef.current = true;
+        clearStreamStallTimer();
+      }
+      setIsPlaying(playing);
+    });
     updateLoadState(player.status);
     return () => {
       statusSubscription.remove();
       playingSubscription.remove();
+      clearStreamStallTimer();
     };
-  }, [player]);
+  }, [clearStreamStallTimer, player, startStreamStallTimer]);
 
   // Bounded load (ported from the Replit Nov 3 hardening): a clip that
   // never finishes loading surfaces a timed retry state instead of
@@ -170,6 +230,8 @@ function Reel({ item, height, isActive }: { item: FeedItem; height: number; isAc
   }, [isActive, loadState, player]);
 
   const retry = () => {
+    clearStreamStallTimer();
+    hasPlayedRef.current = false;
     setLoadState('loading');
     setPlayerError('');
     if (Platform.OS === 'web') {
@@ -216,10 +278,18 @@ function Reel({ item, height, isActive }: { item: FeedItem; height: number; isAc
         playsInline: true,
         preload: isActive ? 'auto' : 'none',
         style: { position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, width: '100%', height: '100%', objectFit: 'cover' },
-        onCanPlay: () => setLoadState('ready'),
-        onPlay: () => setIsPlaying(true),
+        onCanPlay: () => {
+          clearStreamStallTimer();
+          setLoadState('ready');
+          setPlayerError('');
+        },
+        onPlay: handleWebPlaybackResume,
+        onPlaying: handleWebPlaybackResume,
+        onWaiting: handleWebStreamStall,
+        onStalled: handleWebStreamStall,
         onPause: () => setIsPlaying(false),
         onError: (event: React.SyntheticEvent<HTMLVideoElement>) => {
+          clearStreamStallTimer();
           setLoadState('error');
           setPlayerError(event.currentTarget.error?.message ?? '');
         },
@@ -255,7 +325,7 @@ function Reel({ item, height, isActive }: { item: FeedItem; height: number; isAc
           <Feather name="film" size={26} color={c.onImage} />
           <Text style={[st.playerStateText, { color: c.onImage }]}>This clip could not load.</Text>
           {playerError ? <Text style={[st.playerError, { color: c.onImage }]}>{playerError}</Text> : null}
-          <Pressable testID={`retry-${item.id}`} accessibilityRole="button" accessibilityLabel="Try again" onPress={retry} style={st.retry}>
+          <Pressable testID={`retry-${item.id}`} accessibilityRole="button" accessibilityLabel="Retry loading clip" onPress={retry} style={st.retry}>
             <Feather name="rotate-cw" size={15} color={c.onImage} />
             <Text style={[st.actionLabel, { color: c.onImage }]}>Try again</Text>
           </Pressable>
@@ -265,10 +335,10 @@ function Reel({ item, height, isActive }: { item: FeedItem; height: number; isAc
         <Pressable testID={`sound-${item.id}`} accessibilityRole="button" accessibilityLabel={isMuted ? 'Turn sound on' : 'Mute clip'} onPress={toggleMute} style={st.action}>
           <Feather name={isMuted ? 'volume-x' : 'volume-2'} size={24} color={c.onImage} />
         </Pressable>
-        <Pressable testID={`like-${item.id}`} accessibilityRole="button" accessibilityLabel={isLiked ? 'Remove like' : 'Like clip'} onPress={() => { tap(); toggleLike(item.id); }} style={st.action}>
+        <Pressable testID={`like-${item.id}`} accessibilityRole="checkbox" accessibilityLabel={isLiked ? 'Remove like' : 'Like clip'} accessibilityState={{ checked: isLiked }} aria-checked={isLiked} onPress={() => { tap(); toggleLike(item.id); }} style={st.action}>
           <Feather name="heart" size={26} color={isLiked ? c.accentSoft : c.onImage} />
         </Pressable>
-        <Pressable testID={`save-${item.id}`} accessibilityRole="button" accessibilityLabel={isSaved ? 'Remove saved clip' : 'Save clip'} onPress={() => { tap(); toggleSave(item.id); }} style={st.action}>
+        <Pressable testID={`save-${item.id}`} accessibilityRole="checkbox" accessibilityLabel={isSaved ? 'Remove saved clip' : 'Save clip'} accessibilityState={{ checked: isSaved }} aria-checked={isSaved} onPress={() => { tap(); toggleSave(item.id); }} style={st.action}>
           <Feather name="bookmark" size={26} color={isSaved ? c.accentSoft : c.onImage} />
         </Pressable>
       </View>
@@ -307,7 +377,7 @@ function Controls({ visible, onClose }: { visible: boolean; onClose: () => void 
       <View style={[st.sheet, { backgroundColor: c.background, paddingBottom: insets.bottom + 24 }]}>
         <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
           <Text style={{ fontFamily: F.medium, fontSize: 22, letterSpacing: -0.6, color: c.foreground }}>You set the algorithm</Text>
-          <Pressable onPress={onClose} hitSlop={10} testID="close-controls"><Feather name="x" size={22} color={c.foreground} /></Pressable>
+          <Pressable accessibilityRole="button" accessibilityLabel="Close feed controls" onPress={onClose} hitSlop={10} testID="close-controls"><Feather name="x" size={22} color={c.foreground} /></Pressable>
         </View>
         <Text style={{ fontFamily: F.regular, fontSize: 14, color: c.mutedForeground, marginTop: 6 }}>
           Ordered by your goals, not by time spent. Changes reorder the feed and are saved on this device.
@@ -317,11 +387,21 @@ function Controls({ visible, onClose }: { visible: boolean; onClose: () => void 
         <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 8 }}>
           <Text style={[st.small, { color: c.mutedForeground }]}>Explore</Text><Text style={[st.small, { color: c.foreground }]}>{mixLabel(settings.learningMix)}</Text><Text style={[st.small, { color: c.mutedForeground }]}>Focus</Text>
         </View>
-        <View style={{ flexDirection: 'row', gap: 6, marginTop: 10 }}>
+        <View accessibilityRole="radiogroup" accessibilityLabel="Learning mix" style={{ flexDirection: 'row', gap: 6, marginTop: 10 }}>
           {MIX_STEPS.map((v) => {
+            const selected = settings.learningMix === v;
             const on = settings.learningMix >= v - 12;
             return (
-              <Pressable key={v} testID={`mix-${v}`} onPress={() => { tap(); updateSettings({ learningMix: v }); }} style={[st.step, { backgroundColor: on ? c.accent : c.muted }]} />
+              <Pressable
+                key={v}
+                testID={`mix-${v}`}
+                accessibilityRole="radio"
+                accessibilityLabel={`${mixLabel(v)}, ${v}% toward focus`}
+                accessibilityState={{ checked: selected }}
+                aria-checked={selected}
+                onPress={() => { tap(); updateSettings({ learningMix: v }); }}
+                style={[st.step, { backgroundColor: on ? c.accent : c.muted }]}
+              />
             );
           })}
         </View>
@@ -331,7 +411,7 @@ function Controls({ visible, onClose }: { visible: boolean; onClose: () => void 
           {TOPICS.map((t) => {
             const on = settings.topics.includes(t);
             return (
-              <Pressable key={t} testID={`topic-${t}`} onPress={() => toggleTopic(t)} style={[st.chip, { borderColor: on ? c.accent : c.input, backgroundColor: on ? c.accentSoft : 'transparent' }]}>
+              <Pressable key={t} testID={`topic-${t}`} accessibilityRole="checkbox" accessibilityLabel={t} accessibilityState={{ checked: on }} aria-checked={on} onPress={() => toggleTopic(t)} style={[st.chip, { borderColor: on ? c.accent : c.input, backgroundColor: on ? c.accentSoft : 'transparent' }]}>
                 {on ? <Feather name="check" size={13} color={c.accent} /> : null}
                 <Text style={{ fontFamily: F.medium, fontSize: 14, color: c.foreground }}>{t}</Text>
               </Pressable>
