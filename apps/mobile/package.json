@@ -9,7 +9,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test:clip-sources": "node --test tests/check-clip-sources.test.cjs",
     "test:web": "expo export --platform web --output-dir .expo-web-dist && PORT=4173 node scripts/serve-web-dist.cjs",
+    "test:web:error-boundary": "EXPO_PUBLIC_TEST_ERROR_BOUNDARY=true expo export --platform web --output-dir .expo-web-dist && PORT=4174 node scripts/serve-web-dist.cjs",
     "test:ui": "playwright test --config playwright.config.js",
+    "test:ui:error-boundary": "playwright test --config playwright.error-boundary.config.js",
     "build:web": "expo export --platform web --output-dir dist"
   },
   "dependencies": {

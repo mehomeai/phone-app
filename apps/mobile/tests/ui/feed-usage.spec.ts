@@ -1,6 +1,13 @@
 import { expect, test } from '@playwright/test';
 
-test('shows a review label and a source link for clips without clear terms', async ({ page }) => {
+// DEFERRED (Batch 4, Codex direction: feed usage/source link = defer,
+// no surface this batch). Phone-app's feed has no usage-terms link or
+// source-review label for any clip (no `usage-*` testID exists), while
+// the Replit feed shows one for clips without clear terms. Porting it
+// needs the Replit feed data model (per-clip usage terms + source URL),
+// which is a feed feature decision, not a harness fix. Marked fixme so
+// the suite stays honest; un-fixme when the feed gains the surface.
+test.fixme('shows a review label and a source link for clips without clear terms', async ({ page }) => {
   await page.addInitScript(() => {
     localStorage.setItem('me-demo-state-v1', JSON.stringify({
       profiles: [{ id: 'usage-test-profile', name: 'Jordan Rivera', role: 'parent' }],

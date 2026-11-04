@@ -149,6 +149,68 @@ const seed = (): Persisted => ({
   homeLinks: {},
 });
 
+/**
+ * Strict shape check for a persisted conversation (ported from the Replit
+ * Nov 3 stability hardening). A saved record that fails this — e.g.
+ * `messages: null` — must fail the whole hydration closed instead of being
+ * rendered as a private chat.
+ */
+function isSavedConversation(value: unknown): value is Conversation {
+  if (!value || typeof value !== 'object') return false;
+  const conversation = value as Partial<Conversation>;
+  return (
+    typeof conversation.id === 'string' &&
+    conversation.id.length > 0 &&
+    typeof conversation.profileId === 'string' &&
+    conversation.profileId.length > 0 &&
+    typeof conversation.title === 'string' &&
+    conversation.title.trim().length > 0 &&
+    (conversation.assistantMode === undefined ||
+      conversation.assistantMode === 'demo' ||
+      conversation.assistantMode === 'home') &&
+    Array.isArray(conversation.messages) &&
+    conversation.messages.every(
+      (message) =>
+        !!message &&
+        typeof message.id === 'string' &&
+        message.id.length > 0 &&
+        (message.role === 'user' || message.role === 'assistant') &&
+        typeof message.text === 'string' &&
+        Number.isFinite(message.createdAt),
+    )
+  );
+}
+
+function assertValidSavedConversations(value: unknown): asserts value is Conversation[] {
+  if (!Array.isArray(value)) throw new Error('Saved data is invalid.');
+  const seenIds = new Set<string>();
+  for (const conversation of value) {
+    if (!isSavedConversation(conversation) || seenIds.has(conversation.id)) {
+      throw new Error('Saved data is invalid.');
+    }
+    seenIds.add(conversation.id);
+  }
+}
+
+/**
+ * Bounded storage read (ported from the Replit Nov 3 hardening, which
+ * wraps storage operations in a 10s timeout). Without it, a storage read
+ * whose promise never settles leaves the app on the loading screen
+ * forever with no recovery path; with it, the read fails closed into
+ * the standard read-error state and Try again stays available.
+ */
+const STORAGE_READ_TIMEOUT_MS = 10_000;
+
+function withStorageReadTimeout<T>(operation: Promise<T>): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timeout = setTimeout(() => reject(new Error('Local data did not respond.')), STORAGE_READ_TIMEOUT_MS);
+  });
+  return Promise.race([operation, deadline]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
+}
+
 function toLocalMessage(m: HomeChatMessage): Message | null {
   if (m.role === 'system') return null;
   return {
@@ -166,7 +228,13 @@ function errorMessage(error: unknown) {
 interface Ctx extends Persisted {
   status: Status;
   saveError: boolean;
+  /** Setup was completed only in memory because its save failed. */
+  onboardingSessionCompleted: boolean;
   retry: () => void;
+  /** Re-attempt persisting the current state; resolves true only when saved. */
+  retrySave: () => Promise<boolean>;
+  /** Keep a completed setup for this session only (its save keeps failing). */
+  continueSetupInMemory: () => void;
   activeProfile: Profile;
   /** Mode-aware display list: demo follows profiles, home follows the paired identity. */
   visibleChats: Conversation[];
@@ -194,7 +262,10 @@ interface Ctx extends Persisted {
   endCall: (conversationId: string) => void;
   setActiveProfile: (id: string) => void;
   updateProfile: (id: string, patch: Partial<Profile>) => void;
-  addProfile: (p: Omit<Profile, 'id'>) => void;
+  addProfile: (p: Omit<Profile, 'id'>) => string;
+  /** Setup-time profile creation: dedupes by trimmed name + role, activates
+   * the (new or existing) profile, and returns its id. */
+  addSetupProfile: (p: Omit<Profile, 'id'>) => string;
   removeProfile: (id: string) => void;
   createConversation: (title?: string) => string;
   deleteConversation: (id: string) => void;
@@ -282,7 +353,9 @@ interface Ctx extends Persisted {
   updateSettings: (patch: Partial<Settings>) => void;
   toggleLike: (id: string) => void;
   toggleSave: (id: string) => void;
-  setOnboardingCompleted: (completed: boolean) => void;
+  /** Persists first and resolves true only when the flag was saved; on a
+   * failed save the in-memory flag is left unchanged and it resolves false. */
+  setOnboardingCompleted: (completed: boolean) => Promise<boolean>;
   resetDemo: () => Promise<void>;
 }
 
@@ -316,6 +389,7 @@ export function MeProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<Persisted>(seed);
   const [status, setStatus] = useState<Status>('loading');
   const [saveError, setSaveError] = useState(false);
+  const [onboardingSessionCompleted, setOnboardingSessionCompleted] = useState(false);
   const [typing, setTyping] = useState<Record<string, boolean>>({});
   const [chatErrors, setChatErrors] = useState<Record<string, string>>({});
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected');
@@ -627,11 +701,11 @@ export function MeProvider({ children }: { children: ReactNode }) {
     setStatus('loading');
     (async () => {
       try {
-        const [raw, linksRaw, outboxRaw] = await Promise.all([
+        const [raw, linksRaw, outboxRaw] = await withStorageReadTimeout(Promise.all([
           AsyncStorage.getItem(KEY),
           AsyncStorage.getItem(HOME_LINKS_KEY),
           AsyncStorage.getItem(NATIVE_OUTBOX_KEY),
-        ]);
+        ]));
         // Parse the native outbox now; scope-validate it below once the
         // credential tuple is known (previous-pairing entries are dropped,
         // never replayed under a new family).
@@ -660,6 +734,14 @@ export function MeProvider({ children }: { children: ReactNode }) {
         let hydrated: Persisted = { ...base, homeLinks: fileLinks };
         if (raw) {
           const parsed = JSON.parse(raw) as Partial<Persisted>;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new Error('Saved data is invalid.');
+          }
+          // Fail closed on malformed records: a corrupt saved conversation
+          // is a read error (saved bytes preserved), never a rendered chat.
+          if (parsed.conversations !== undefined) {
+            assertValidSavedConversations(parsed.conversations);
+          }
           const savedSettings = parsed.settings as Partial<Settings> | undefined;
           const migratedSettings: Settings = {
             ...base.settings,
@@ -671,7 +753,9 @@ export function MeProvider({ children }: { children: ReactNode }) {
             ...base,
             ...parsed,
             settings: migratedSettings,
-            conversations: Array.isArray(parsed.conversations) ? parsed.conversations : base.conversations,
+            // A saved snapshot without a conversations key holds NO
+            // conversations — never resurrect the seeded demo chats.
+            conversations: parsed.conversations !== undefined ? parsed.conversations : [],
             homeLinks: { ...fileLinks, ...(parsed.homeLinks ?? {}) },
             onboardingCompleted: typeof parsed.onboardingCompleted === 'boolean' ? parsed.onboardingCompleted : true,
           };
@@ -3123,6 +3207,7 @@ export function MeProvider({ children }: { children: ReactNode }) {
     ...state,
     status,
     saveError,
+    onboardingSessionCompleted,
     typing,
     chatErrors,
     connectionStatus,
@@ -3145,12 +3230,52 @@ export function MeProvider({ children }: { children: ReactNode }) {
     taskArtifacts,
     activeCallId,
     retry: () => setAttempt((current) => current + 1),
+    retrySave: async () => {
+      const completed = stateRef.current.onboardingCompleted || onboardingSessionCompleted;
+      const nextState = { ...stateRef.current, onboardingCompleted: completed };
+      try {
+        await AsyncStorage.setItem(KEY, JSON.stringify(nextState));
+      } catch {
+        setSaveError(true);
+        return false;
+      }
+      setOnboardingSessionCompleted(false);
+      setSaveError(false);
+      if (completed !== stateRef.current.onboardingCompleted) {
+        setState((current) => ({ ...current, onboardingCompleted: completed }));
+      }
+      return true;
+    },
+    continueSetupInMemory: () => {
+      setOnboardingSessionCompleted(true);
+      setSaveError(true);
+    },
     // Profile switching stays functional for demo/household UX but can never
     // impersonate in home mode: home display is bound to the authenticated
     // paired identity via visibleChats, not to the selected profile.
     setActiveProfile: (id) => setState((current) => ({ ...current, activeProfileId: id })),
     updateProfile: (id, patch) => setState((current) => ({ ...current, profiles: current.profiles.map((profile) => (profile.id === id ? { ...profile, ...patch } : profile)) })),
-    addProfile: (profile) => setState((current) => ({ ...current, profiles: [...current.profiles, { ...profile, id: uid() }] })),
+    addProfile: (profile) => {
+      const id = uid();
+      setState((current) => ({ ...current, profiles: [...current.profiles, { ...profile, id }] }));
+      return id;
+    },
+    addSetupProfile: (profile) => {
+      const current = stateRef.current;
+      const normalizedName = profile.name.trim().toLocaleLowerCase();
+      const existing = current.profiles.find(
+        (candidate) => candidate.name.trim().toLocaleLowerCase() === normalizedName && candidate.role === profile.role,
+      );
+      if (existing) {
+        if (current.activeProfileId !== existing.id) {
+          setState((state) => ({ ...state, activeProfileId: existing.id }));
+        }
+        return existing.id;
+      }
+      const created = { ...profile, name: profile.name.trim(), id: uid() };
+      setState((state) => ({ ...state, profiles: [...state.profiles, created], activeProfileId: created.id }));
+      return created.id;
+    },
     removeProfile: (id) =>
       setState((current) => {
         if (current.profiles.length <= 1) return current;
@@ -3299,7 +3424,19 @@ export function MeProvider({ children }: { children: ReactNode }) {
     },
     toggleLike: (id) => setState((current) => ({ ...current, liked: current.liked.includes(id) ? current.liked.filter((item) => item !== id) : [...current.liked, id] })),
     toggleSave: (id) => setState((current) => ({ ...current, saved: current.saved.includes(id) ? current.saved.filter((item) => item !== id) : [...current.saved, id] })),
-    setOnboardingCompleted: (completed) => setState((current) => ({ ...current, onboardingCompleted: completed })),
+    setOnboardingCompleted: async (completed) => {
+      const nextState = { ...stateRef.current, onboardingCompleted: completed };
+      try {
+        await AsyncStorage.setItem(KEY, JSON.stringify(nextState));
+      } catch {
+        setSaveError(true);
+        return false;
+      }
+      setOnboardingSessionCompleted(false);
+      setSaveError(false);
+      setState((current) => ({ ...current, onboardingCompleted: completed }));
+      return true;
+    },
     resetDemo: async () => {
       connectionAttempt.current += 1;
       timers.current.forEach((_, conversationId) => clearTimer(conversationId));
@@ -3325,6 +3462,7 @@ export function MeProvider({ children }: { children: ReactNode }) {
       persistNativeOutbox();
       stopAllNativeWatches();
       decisionGateRef.current = new DecisionGate();
+      setOnboardingSessionCompleted(false);
       setCapabilityResolved(false);
       setNativeApprovals(null);
       setNativeApprovalsError(null);
@@ -3358,7 +3496,7 @@ export function MeProvider({ children }: { children: ReactNode }) {
     },
   };
   }, [
-    state, status, saveError, typing, chatErrors, connectionStatus, connectionError,
+    state, status, saveError, onboardingSessionCompleted, typing, chatErrors, connectionStatus, connectionError,
     enrollment, identityResolved, backend, account, tasksByConv, tasksLoading, taskErrors, taskArtifacts,
     activeCallId, activeProfile, notifications, openConversation, sendMessage, retryMessage,
     enrollHome, enrollWithSetupJson, revokeEnrollment, useDemoMode, verifyHomeConnection,

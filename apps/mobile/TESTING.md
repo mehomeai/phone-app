@@ -86,7 +86,20 @@ npm install            # Expo SDK 58 / RN 0.88 / React 19.3 pins (large download
 npm run typecheck      # tsc --noEmit (expo base + allowImportingTsExtensions)
 npm run test:clip-sources
 npm run test:ui        # expo export + local static server + Playwright 400x720
+npm run test:ui:error-boundary # error-boundary spec only, against the
+                       # crash-fixture build (playwright.error-boundary.config.js)
 ```
+
+The main `test:ui` config testIgnores `tests/ui/error-boundary.spec.ts`:
+its build sets `EXPO_PUBLIC_TEST_ERROR_BOUNDARY=true` (app/index.tsx
+throws once per session), which would start every other spec on the
+crash screen. Batch 4 (Nov 2026) also ported from the Replit stability
+round: strict saved-conversation validation + no seed resurrection on a
+missing conversations key, a 10s storage-read timeout, setup save/retry
+semantics with an in-setup add-profile form, and a 15s feed load
+timeout. `tests/ui/feed-usage.spec.ts` is marked fixme (deferred: the
+feed has no usage-terms/source surface yet), and the archive.org
+feed-playback test needs direct egress this VM does not have.
 
 `npm run test:ui` preserves the prototype's checks: clean drafts, first-message
 persistence + reload, profile isolation, simulated-call lifecycle. Set

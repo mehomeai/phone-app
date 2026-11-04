@@ -1,5 +1,7 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
+  AccessibilityInfo,
+  findNodeHandle,
   Modal,
   Platform,
   Pressable,
@@ -7,6 +9,7 @@ import {
   StyleSheet,
   Text,
   View,
+  type TextInstance,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useColors } from '@/hooks/useColors';
@@ -21,6 +24,28 @@ export type ErrorFallbackProps = {
 export function ErrorFallback({ error, resetError }: ErrorFallbackProps) {
   const colors = useColors();
   const insets = useSafeAreaInsets();
+
+  const titleRef = useRef<TextInstance | null>(null);
+
+  // Move focus to the fallback heading so the failure is announced and
+  // keyboard/screen-reader users land on the recovery path (ported from
+  // the Replit Nov 3 hardening).
+  useEffect(() => {
+    const title = titleRef.current;
+    if (!title) {
+      return;
+    }
+
+    if (Platform.OS === 'web') {
+      (title as unknown as { focus?: () => void }).focus?.();
+      return;
+    }
+
+    const reactTag = findNodeHandle(title);
+    if (reactTag != null) {
+      AccessibilityInfo.setAccessibilityFocus(reactTag);
+    }
+  }, []);
 
   const [isModalVisible, setIsModalVisible] = useState(false);
 
@@ -68,15 +93,27 @@ export function ErrorFallback({ error, resetError }: ErrorFallbackProps) {
       ) : null}
 
       <View style={styles.content}>
-        <Text style={[styles.title, { color: colors.foreground }]}>
+        <Text
+          ref={titleRef}
+          accessibilityRole="header"
+          // tabIndex is a web-only prop the RN 0.88 Text types omit; it
+          // makes the heading focusable so the effect above can focus it.
+          {...({ tabIndex: -1 } as Record<string, number>)}
+          style={[styles.title, { color: colors.foreground }]}
+        >
           Something went wrong
         </Text>
 
-        <Text style={[styles.message, { color: colors.mutedForeground }]}>
+        <Text
+          accessibilityRole="alert"
+          accessibilityLiveRegion="assertive"
+          style={[styles.message, { color: colors.mutedForeground }]}
+        >
           Please reload the app to continue.
         </Text>
 
         <Pressable
+          accessibilityRole="button"
           onPress={handleRestart}
           style={({ pressed }) => [
             styles.button,

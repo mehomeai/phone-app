@@ -1,5 +1,22 @@
 import { expect, test, type Page } from '@playwright/test';
 
+// ADAPTED to phone-app (Batch 4, Codex direction: split spec-by-spec;
+// group 5 = adapt, no production changes).
+// The Replit original drove an in-chat browser tool that does not exist
+// in phone-app: there is no `use-chat-browser` composer entry, no
+// browser-request field, and no in-app page preview / action-approval
+// flow (browser-load-button, browser-page-preview, browser-ask-me,
+// browser-review-action). Phone-app's browser is a deliberate chooser:
+// it opens pages ONLY through the system browser after an explicit tap
+// (app/browser.tsx: "Pages open only after you choose them"), with
+// `open-chat-browser` on the Chats screen and `browser-address` /
+// `browser-open` fields. The preview-before-action and stalled-load
+// timeout/retry behaviors are therefore NOT asserted here — they are a
+// deferred feature gap, tracked in the Batch 4 disposition table, not a
+// behavior this copy claims. What this spec pins is the phone contract:
+// browser entry from Chat, no site is contacted before the user acts,
+// and the open action stays disabled until an address exists.
+
 async function openChat(page: Page) {
   await page.goto('/');
   await expect(page.getByTestId('skip-onboarding')).toBeVisible();
@@ -17,82 +34,48 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test('passes a chat request into the browser and previews the page before any site action', async ({ page }) => {
+test('opens the browser from chat and contacts no site before the user acts', async ({ page }) => {
   const siteRequests: string[] = [];
-  await page.route('https://example.com/report', async (route) => {
+  await page.route('https://example.com/**', async (route) => {
     siteRequests.push(route.request().method());
-    await route.fulfill({
-      status: 200,
-      contentType: 'text/html; charset=utf-8',
-      body: '<!doctype html><html><head><title>Quarterly Update</title><script>ignore this hidden text</script></head><body><main><h1>Shipping update</h1><p>The shipment is delayed until Friday.</p></main></body></html>',
-    });
+    await route.fulfill({ status: 200, contentType: 'text/html', body: '<p>must not be fetched</p>' });
   });
 
   await openChat(page);
-  const request = 'Check this latest update';
-  const url = 'https://example.com/report';
-  await page.getByTestId('chat-input').fill(`${request}: ${url}`);
-  await page.getByTestId('use-chat-browser').click();
+  await page.getByTestId('open-chat-browser').click();
 
-  await expect(page.getByTestId('browser-address')).toHaveValue(url);
-  await expect(page.getByTestId('browser-request')).toHaveValue(request);
+  const address = page.getByTestId('browser-address');
+  await expect(address).toBeVisible();
+  await expect(address).toHaveValue('');
+  // Nothing to open yet: the open action is disabled with no address.
+  await expect(page.getByTestId('browser-open')).toBeDisabled();
+  await expect(page.getByText('Pages open only after you choose them.')).toBeVisible();
+  await expect(page.getByTestId('browser-site-wikipedia')).toBeVisible();
   expect(siteRequests).toEqual([]);
 
-  await page.getByTestId('browser-load-button').click();
-  await expect(page.getByTestId('browser-page-preview')).toBeVisible();
-  await expect(page.getByTestId('browser-page-title')).toHaveText('Quarterly Update');
-  await expect(page.getByTestId('browser-page-content')).toContainText('The shipment is delayed until Friday.');
-  await expect(page.getByTestId('browser-page-content')).not.toContainText('ignore this hidden text');
-  await expect(page.getByTestId('browser-ask-me')).toBeDisabled();
-  await expect(page.getByText('Connect Me Home to analyze page text. This app does not send it to a cloud model.')).toBeVisible();
-  expect(siteRequests).toEqual(['GET']);
-
-  await page.getByTestId('browser-review-action').click();
-  const preview = page.getByTestId('browser-action-preview');
-  await expect(preview).toBeVisible();
-  await expect(preview).toContainText(request);
-  await expect(preview).toContainText(url);
-  await expect(preview).toContainText('Nothing has been submitted');
-  await expect(page.getByTestId('browser-approve-action')).toBeVisible();
-  expect(siteRequests).toEqual(['GET']);
+  await address.fill('https://example.com/report');
+  await expect(page.getByTestId('browser-open')).toBeEnabled();
+  // Typing an address still contacts nothing; opening is a separate,
+  // explicit user action (system browser, outside this web preview).
+  expect(siteRequests).toEqual([]);
 });
 
-test('ends a stalled page load with a retryable error and keeps the address', async ({ page }) => {
-  let requests = 0;
-  let releaseFirstRequest!: () => void;
-  const firstResponseGate = new Promise<void>((resolve) => { releaseFirstRequest = resolve; });
-  let firstRequestStarted!: () => void;
-  const firstRequest = new Promise<void>((resolve) => { firstRequestStarted = resolve; });
-
-  await page.route('https://example.com/slow', async (route) => {
-    requests += 1;
-    if (requests === 1) {
-      firstRequestStarted();
-      await firstResponseGate;
-      try {
-        await route.fulfill({ status: 200, contentType: 'text/html', body: '<p>Late response</p>' });
-      } catch {
-        // The app aborts the timed-out request; its retry gets a fresh response.
-      }
-      return;
-    }
-    await route.fulfill({
-      status: 200,
-      contentType: 'text/html',
-      body: '<!doctype html><html><head><title>Recovered page</title></head><body><p>Retry succeeded.</p></body></html>',
-    });
-  });
-
+test('starts with a fresh address each time the browser is opened', async ({ page }) => {
+  // The browser screen holds the address in local state and unmounts on
+  // back, so reopening starts empty with the open action disabled —
+  // unlike the Replit in-chat tool, which kept the address across a
+  // stalled load for its retry. That retention is part of the deferred
+  // browser-tool gap, not current phone behavior.
   await openChat(page);
-  await page.getByTestId('chat-input').fill('Read https://example.com/slow');
-  await page.getByTestId('use-chat-browser').click();
+  await page.getByTestId('open-chat-browser').click();
+  await page.getByTestId('browser-address').fill('https://example.com/slow');
   await expect(page.getByTestId('browser-address')).toHaveValue('https://example.com/slow');
-  await page.getByTestId('browser-load-button').click();
-  await firstRequest;
+  await expect(page.getByTestId('browser-open')).toBeEnabled();
 
-  await expect(page.getByText('This page took too long to respond. Check the address and try again.')).toBeVisible({ timeout: 17_000 });
-  await expect(page.getByTestId('browser-address')).toHaveValue('https://example.com/slow');
-  releaseFirstRequest();
-  await page.getByTestId('browser-load-button').click();
-  await expect(page.getByTestId('browser-page-title')).toHaveText('Recovered page');
+  await page.getByTestId('browser-back').click();
+  await expect(page.getByTestId('chat-input')).toBeVisible();
+
+  await page.getByTestId('open-chat-browser').click();
+  await expect(page.getByTestId('browser-address')).toHaveValue('');
+  await expect(page.getByTestId('browser-open')).toBeDisabled();
 });

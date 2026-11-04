@@ -1,5 +1,15 @@
 import { expect, test } from '@playwright/test';
 
+// Batch 4 disposition (Codex: split spec-by-spec):
+// - 'plays the redirected bridge clip' is ENVIRONMENTAL in this VM: it
+//   needs direct egress to archive.org / its CDN, which the VM proxy
+//   blocks (the clip element reports a format error before any bytes
+//   arrive). Kept verbatim; expected to pass where egress is available.
+// - 'shows a retry state' is a PORT: phone-app's feed gained the Replit
+//   15s load timeout (FEED_LOAD_TIMEOUT_MS in app/(tabs)/feed.tsx) that
+//   surfaces 'This clip could not load.' + 'This clip took too long to
+//   load. Try again.' + a Try again retry.
+
 test('plays the redirected bridge clip in the mobile feed preview', async ({ page }) => {
   const cdnResponses: number[] = [];
   page.on('response', (response) => {
