@@ -13,7 +13,7 @@
     "build:web": "expo export --platform web --output-dir dist"
   },
   "dependencies": {
-    "@react-native-async-storage/async-storage": "2.2.0",
+    "@react-native-async-storage/async-storage": "3.1.1",
     "@tanstack/react-query": "5.105.3",
     "expo": "~58.0.16",
     "expo-auth-session": "~58.0.16",
