@@ -14,6 +14,7 @@ import type { FeedItem } from '@/lib/types';
 
 const MIX_STEPS = [0, 25, 50, 75, 100];
 const DESCRIPTION_PREVIEW_LENGTH = 90;
+const FEED_LOAD_TIMEOUT_MS = 15_000;
 const mixLabel = (v: number) => (v < 20 ? 'Wander widely' : v < 45 ? 'Mostly exploring' : v < 70 ? 'Balanced' : v < 90 ? 'Mostly my topics' : 'Only my topics first');
 
 export default function FeedScreen() {
@@ -138,6 +139,19 @@ function Reel({ item, height, isActive }: { item: FeedItem; height: number; isAc
     };
   }, [player]);
 
+  // Bounded load (ported from the Replit Nov 3 hardening): a clip that
+  // never finishes loading surfaces a timed retry state instead of
+  // spinning forever.
+  useEffect(() => {
+    if (!isActive || loadState !== 'loading') return;
+    const timeout = setTimeout(() => {
+      setPlayerError('This clip took too long to load. Try again.');
+      setLoadState('error');
+      setIsPlaying(false);
+    }, FEED_LOAD_TIMEOUT_MS);
+    return () => clearTimeout(timeout);
+  }, [isActive, item.id, loadState]);
+
   useEffect(() => {
     const webVideo = webVideoRef.current;
     if (loadState === 'ready' && isActive) {
@@ -241,7 +255,7 @@ function Reel({ item, height, isActive }: { item: FeedItem; height: number; isAc
           <Feather name="film" size={26} color={c.onImage} />
           <Text style={[st.playerStateText, { color: c.onImage }]}>This clip could not load.</Text>
           {playerError ? <Text style={[st.playerError, { color: c.onImage }]}>{playerError}</Text> : null}
-          <Pressable testID={`retry-${item.id}`} accessibilityRole="button" onPress={retry} style={st.retry}>
+          <Pressable testID={`retry-${item.id}`} accessibilityRole="button" accessibilityLabel="Try again" onPress={retry} style={st.retry}>
             <Feather name="rotate-cw" size={15} color={c.onImage} />
             <Text style={[st.actionLabel, { color: c.onImage }]}>Try again</Text>
           </Pressable>

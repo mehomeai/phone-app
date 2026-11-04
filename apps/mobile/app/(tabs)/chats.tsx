@@ -185,6 +185,12 @@ function HistoryList({ conversations, onOpen, onDelete }: { conversations: Conve
       renderItem={({ item }: ListRenderItemInfo<Conversation>) => {
         const last = item.messages[item.messages.length - 1];
         const snippet = last ? visibleSnippet(last.text) : 'Simulated call · no audio';
+        // Ported from the Replit copy's Nov 3 fix: a new conversation's
+        // title is its first message (truncated to 42 chars), so when the
+        // latest message is still that first one, the preview line would
+        // repeat the title inside the same row. Show it only when it adds
+        // different text.
+        const showSnippet = snippet !== item.title && !(item.messages.length === 1 && snippet.startsWith(item.title));
         return (
           <Card style={{ padding: 0, overflow: 'hidden', flexDirection: 'row', alignItems: 'center' }}>
             <Pressable testID={`conv-${item.id}`} accessibilityRole="button" onPress={() => onOpen(item.id)} style={({ pressed }) => [st.historyRow, { opacity: pressed ? 0.72 : 1 }]}>
@@ -193,7 +199,9 @@ function HistoryList({ conversations, onOpen, onDelete }: { conversations: Conve
               </View>
               <View style={{ flex: 1 }}>
                 <Text numberOfLines={1} style={{ fontFamily: F.medium, fontSize: 15, color: c.foreground }}>{item.title}</Text>
-                <Text numberOfLines={1} style={{ fontFamily: F.regular, fontSize: 13, color: c.mutedForeground, marginTop: 4 }}>{snippet}</Text>
+                {showSnippet ? (
+                  <Text numberOfLines={1} style={{ fontFamily: F.regular, fontSize: 13, color: c.mutedForeground, marginTop: 4 }}>{snippet}</Text>
+                ) : null}
               </View>
               <Feather name="chevron-right" size={17} color={c.mutedForeground} />
             </Pressable>

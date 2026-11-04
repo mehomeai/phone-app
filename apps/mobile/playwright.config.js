@@ -8,6 +8,11 @@ const executablePath =
 
 module.exports = defineConfig({
   testDir: './tests/ui',
+  // The error-boundary spec needs the crash-fixture build
+  // (EXPO_PUBLIC_TEST_ERROR_BOUNDARY=true), which would make every other
+  // spec start on a crash screen. It runs only under
+  // playwright.error-boundary.config.js (`npm run test:ui:error-boundary`).
+  testIgnore: ['**/error-boundary.spec.ts'],
   fullyParallel: false,
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 1 : 0,

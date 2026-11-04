@@ -25,7 +25,6 @@ export function ChatComposer({ conversationId, onConversationId, showBack = fals
   const top = useTopInset();
   const insets = useSafeAreaInsets();
   const {
-    conversations,
     visibleChats,
     sendMessage,
     retryMessage,
@@ -63,9 +62,12 @@ export function ChatComposer({ conversationId, onConversationId, showBack = fals
   const currentId = useRef<string | null>(conversationId);
   const id = conversationId ?? currentId.current;
   // Scoped lookup: a deep link or stale id outside the current identity
-  // resolves to nothing instead of leaking cached private content.
-  const conv = (settings.assistantMode === 'home' ? visibleChats : conversations).find((x) => x.id === id);
-  const scopedOut = settings.assistantMode === 'home' && !!id && !conv;
+  // resolves to nothing instead of leaking cached private content. The
+  // list screen already renders visibleChats only; the composer uses the
+  // same scope in demo mode too (profile-filtered), so a direct link to
+  // another profile's chat fails closed instead of rendering it.
+  const conv = visibleChats.find((x) => x.id === id);
+  const scopedOut = !!id && !conv;
   const messages = conv?.messages ?? [];
   const isTyping = !!(id && typing[id]);
   const chatError = id ? chatErrors[id] : undefined;
@@ -120,7 +122,7 @@ export function ChatComposer({ conversationId, onConversationId, showBack = fals
 
   if (scopedOut) {
     return (
-      <View style={{ flex: 1, backgroundColor: c.background, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 32 }}>
+      <View testID="chat-access-denied" style={{ flex: 1, backgroundColor: c.background, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 32 }}>
         <Text style={{ fontFamily: F.medium, fontSize: 17, color: c.foreground, textAlign: 'center' }}>Conversation unavailable</Text>
         <Text style={{ fontFamily: F.regular, fontSize: 14, lineHeight: 20, color: c.mutedForeground, textAlign: 'center', marginTop: 8 }}>
           It does not belong to the currently paired home identity. Pair the right device or pick another conversation.

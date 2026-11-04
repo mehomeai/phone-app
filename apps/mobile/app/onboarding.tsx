@@ -2,24 +2,38 @@ import { Feather } from '@expo/vector-icons';
 import { Image } from 'expo-image';
 import { router } from 'expo-router';
 import React, { useEffect, useRef, useState } from 'react';
-import { Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Avatar, Button, Card, F, tap } from '@/components/ui';
 import { useMe } from '@/context/MeContext';
 import { useColors } from '@/hooks/useColors';
 import { roleLabel } from '@/lib/data';
-import type { Profile } from '@/lib/types';
+import type { Profile, Role } from '@/lib/types';
 
 const TOTAL_STEPS = 4;
+const PROFILE_ROLES: Role[] = ['parent', 'adult', 'child'];
 const mixLabel = (value: number) => (value < 20 ? 'Wander widely' : value < 45 ? 'Mostly exploring' : value < 70 ? 'Balanced' : value < 90 ? 'Mostly my topics' : 'Only my topics first');
 
 export default function OnboardingScreen() {
   const c = useColors();
   const insets = useSafeAreaInsets();
-  const { profiles, activeProfile, settings, setActiveProfile, setOnboardingCompleted } = useMe();
+  const {
+    profiles,
+    activeProfile,
+    settings,
+    saveError,
+    setActiveProfile,
+    addSetupProfile,
+    setOnboardingCompleted,
+    retrySave,
+    continueSetupInMemory,
+  } = useMe();
   const [step, setStep] = useState(0);
   const [pairingDemo, setPairingDemo] = useState<'idle' | 'running' | 'done'>('idle');
+  const [savingSetup, setSavingSetup] = useState(false);
+  const [setupSaveError, setSetupSaveError] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const closeInProgress = useRef(false);
   const topInset = Platform.OS === 'web' ? Math.max(insets.top, 67) : insets.top;
   const bottomInset = Platform.OS === 'web' ? Math.max(insets.bottom, 34) : insets.bottom;
 
@@ -27,9 +41,44 @@ export default function OnboardingScreen() {
     if (timer.current) clearTimeout(timer.current);
   }, []);
 
-  const close = () => {
-    setOnboardingCompleted(true);
-    router.back();
+  const returnToApp = () => {
+    if (router.canGoBack()) router.back();
+    else router.replace('/(tabs)/feed');
+  };
+
+  // Setup completion is persisted BEFORE leaving (ported from the Replit
+  // Nov 3 hardening): a failed save keeps setup open with a retry /
+  // continue-for-this-session choice instead of silently losing it.
+  const close = async () => {
+    if (closeInProgress.current) return;
+    closeInProgress.current = true;
+    setSavingSetup(true);
+    setSetupSaveError(false);
+    let saved = false;
+    try {
+      saved = await setOnboardingCompleted(true);
+    } catch {
+      saved = false;
+    }
+    closeInProgress.current = false;
+    setSavingSetup(false);
+    if (saved) returnToApp();
+    else setSetupSaveError(true);
+  };
+
+  const retryDraftSave = async () => {
+    if (closeInProgress.current) return;
+    closeInProgress.current = true;
+    setSavingSetup(true);
+    await retrySave();
+    closeInProgress.current = false;
+    setSavingSetup(false);
+  };
+
+  const continueForSession = () => {
+    if (closeInProgress.current) return;
+    continueSetupInMemory();
+    returnToApp();
   };
 
   const runPairingDemo = () => {
@@ -41,7 +90,7 @@ export default function OnboardingScreen() {
 
   const goForward = () => {
     if (step === TOTAL_STEPS - 1) {
-      close();
+      void close();
       return;
     }
     tap();
@@ -60,7 +109,8 @@ export default function OnboardingScreen() {
         <Pressable
           testID="skip-onboarding"
           accessibilityRole="button"
-          onPress={close}
+          disabled={savingSetup}
+          onPress={() => { void close(); }}
           hitSlop={10}
           style={st.skip}
         >
@@ -81,13 +131,15 @@ export default function OnboardingScreen() {
         style={st.scroll}
         contentContainerStyle={[st.content, { paddingBottom: 24 }]}
         showsVerticalScrollIndicator={false}
+        scrollEnabled={!savingSetup}
+        pointerEvents={savingSetup ? 'none' : 'auto'}
       >
         <Text style={{ fontFamily: F.mono, fontSize: 11, letterSpacing: 1.2, color: c.accent }}>
           STEP {step + 1} OF {TOTAL_STEPS}
         </Text>
 
         {step === 0 ? (
-          <ProfileStep profiles={profiles} activeId={activeProfile.id} onSelect={setActiveProfile} />
+          <ProfileStep profiles={profiles} activeId={activeProfile.id} onSelect={setActiveProfile} onCreate={addSetupProfile} />
         ) : step === 1 ? (
           <InfoStep
             icon="message-circle"
@@ -175,11 +227,59 @@ export default function OnboardingScreen() {
         )}
       </ScrollView>
 
+      {saveError && !setupSaveError ? (
+        <View testID="setup-memory-warning" accessibilityRole="alert" style={{ paddingHorizontal: 20, paddingBottom: 10 }}>
+          <Card style={{ borderColor: c.destructive }}>
+            <Text style={{ fontFamily: F.medium, fontSize: 13, lineHeight: 19, color: c.foreground }}>
+              Setup changes are available in memory for this session, but this device hasn’t saved them yet. Your previously saved profiles and conversations are unchanged.
+            </Text>
+            <View style={{ marginTop: 12 }}>
+              <Button
+                testID="retry-setup-draft-save"
+                variant="accent"
+                label={savingSetup ? 'Saving setup…' : 'Retry saving setup'}
+                disabled={savingSetup}
+                onPress={() => { void retryDraftSave(); }}
+              />
+            </View>
+          </Card>
+        </View>
+      ) : null}
+
+      {setupSaveError ? (
+        <View testID="setup-save-error" accessibilityRole="alert" style={{ paddingHorizontal: 20, paddingBottom: 10 }}>
+          <Card style={{ borderColor: c.destructive }}>
+            <Text style={{ fontFamily: F.medium, fontSize: 13, lineHeight: 19, color: c.foreground }}>
+              Setup couldn’t be saved. Your current setup is still in memory for this session, and previously saved profiles and conversations are intact. Retry to save it, or continue only for this session.
+            </Text>
+            <View style={{ marginTop: 12 }}>
+              <Button
+                testID="retry-setup-save"
+                variant="accent"
+                label={savingSetup ? 'Saving setup…' : 'Retry saving setup'}
+                disabled={savingSetup}
+                onPress={() => { void close(); }}
+              />
+            </View>
+            <View style={{ marginTop: 8 }}>
+              <Button
+                testID="continue-setup-session"
+                variant="ghost"
+                label="Continue for this session"
+                disabled={savingSetup}
+                onPress={continueForSession}
+              />
+            </View>
+          </Card>
+        </View>
+      ) : null}
+
       <View style={[st.footer, { paddingBottom: bottomInset + 12, borderTopColor: c.border, backgroundColor: c.background }]}>
         {step > 0 ? (
           <Pressable
             testID="onboarding-back"
             accessibilityRole="button"
+            disabled={savingSetup}
             onPress={() => { tap(); setStep((current) => Math.max(current - 1, 0)); }}
             style={st.backButton}
           >
@@ -191,7 +291,8 @@ export default function OnboardingScreen() {
             testID={step === TOTAL_STEPS - 1 ? 'finish-onboarding' : 'onboarding-next'}
             variant="primary"
             icon={step === TOTAL_STEPS - 1 ? 'check' : 'arrow-right'}
-            label={step === TOTAL_STEPS - 1 ? 'Finish setup' : step === 0 ? 'Continue' : 'Next'}
+            label={savingSetup ? 'Saving setup…' : step === TOTAL_STEPS - 1 ? 'Finish setup' : step === 0 ? 'Continue' : 'Next'}
+            disabled={savingSetup}
             onPress={goForward}
           />
         </View>
@@ -200,8 +301,31 @@ export default function OnboardingScreen() {
   );
 }
 
-function ProfileStep({ profiles, activeId, onSelect }: { profiles: Profile[]; activeId: string; onSelect: (id: string) => void }) {
+function ProfileStep({
+  profiles,
+  activeId,
+  onSelect,
+  onCreate,
+}: {
+  profiles: Profile[];
+  activeId: string;
+  onSelect: (id: string) => void;
+  onCreate: (profile: Omit<Profile, 'id'>) => string;
+}) {
   const c = useColors();
+  const [adding, setAdding] = useState(false);
+  const [name, setName] = useState('');
+  const [role, setRole] = useState<Role>('adult');
+  const validName = name.trim().length > 0;
+
+  const createProfile = () => {
+    if (!validName) return;
+    onCreate({ name: name.trim(), role });
+    setName('');
+    setRole('adult');
+    setAdding(false);
+  };
+
   return (
     <>
       <Text style={[st.title, { color: c.foreground }]}>Choose a profile for this phone</Text>
@@ -232,6 +356,58 @@ function ProfileStep({ profiles, activeId, onSelect }: { profiles: Profile[]; ac
             </Pressable>
           );
         })}
+        {adding ? (
+          <View style={[st.addProfileForm, { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: c.border }]}>
+            <TextInput
+              testID="onboarding-profile-name"
+              accessibilityLabel="New household member name"
+              value={name}
+              onChangeText={setName}
+              placeholder="Name"
+              placeholderTextColor={c.mutedForeground}
+              maxLength={60}
+              returnKeyType="done"
+              onSubmitEditing={createProfile}
+              style={[st.profileInput, { borderColor: c.input, color: c.foreground, backgroundColor: c.background }]}
+            />
+            <View style={st.roleChoices} accessibilityRole="radiogroup" accessibilityLabel="Choose a role">
+              {PROFILE_ROLES.map((option) => {
+                const selected = role === option;
+                return (
+                  <Pressable
+                    key={option}
+                    testID={`onboarding-profile-role-${option}`}
+                    accessibilityRole="radio"
+                    accessibilityState={{ selected }}
+                    accessibilityLabel={roleLabel(option)}
+                    onPress={() => { tap(); setRole(option); }}
+                    style={[st.roleChoice, { borderColor: selected ? c.accent : c.input, backgroundColor: selected ? c.accentSoft : 'transparent' }]}
+                  >
+                    <Text style={{ fontFamily: F.medium, fontSize: 13, color: c.foreground }}>{roleLabel(option)}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+            <View style={st.roleChoices}>
+              <View style={{ flex: 1 }}>
+                <Button testID="onboarding-create-profile" label="Add profile" icon="user-plus" onPress={createProfile} disabled={!validName} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Button testID="onboarding-cancel-profile" label="Cancel" variant="ghost" onPress={() => { setAdding(false); setName(''); }} />
+              </View>
+            </View>
+          </View>
+        ) : (
+          <Pressable
+            testID="onboarding-add-profile"
+            accessibilityRole="button"
+            onPress={() => { tap(); setAdding(true); }}
+            style={[st.addProfileButton, { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: c.border }]}
+          >
+            <Feather name="plus" size={17} color={c.accent} />
+            <Text style={{ fontFamily: F.medium, fontSize: 14, color: c.accent }}>Add a household member</Text>
+          </Pressable>
+        )}
       </Card>
     </>
   );
@@ -265,6 +441,11 @@ const st = StyleSheet.create({
   title: { fontFamily: F.medium, fontSize: 29, letterSpacing: -0.9, lineHeight: 34, marginTop: 22 },
   description: { fontFamily: F.regular, fontSize: 15, lineHeight: 23, marginTop: 10 },
   profileRow: { minHeight: 68, flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 10 },
+  addProfileButton: { minHeight: 54, flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 10 },
+  addProfileForm: { paddingVertical: 14, gap: 12 },
+  profileInput: { height: 44, borderWidth: 1, borderRadius: 10, paddingHorizontal: 12, fontFamily: F.regular, fontSize: 15 },
+  roleChoices: { flexDirection: 'row', gap: 8 },
+  roleChoice: { flex: 1, alignItems: 'center', borderWidth: 1, borderRadius: 999, paddingVertical: 9 },
   radio: { width: 21, height: 21, borderRadius: 11, borderWidth: 1.5, alignItems: 'center', justifyContent: 'center' },
   radioDot: { width: 11, height: 11, borderRadius: 6 },
   inline: { flexDirection: 'row', alignItems: 'center', gap: 10 },

@@ -93,7 +93,7 @@ export function Avatar({ name, size = 40, active }: { name: string; size?: numbe
 /** Wraps a screen so it shows hydration / storage-error states instead of seeded data. */
 export function Hydrated({ children }: { children: ReactNode }) {
   const c = useColors();
-  const { status, retry, saveError } = useMe();
+  const { status, retry, saveError, retrySave, onboardingSessionCompleted } = useMe();
   if (status === 'loading') {
     return (
       <View style={[s.center, { backgroundColor: c.background }]}>
@@ -106,18 +106,28 @@ export function Hydrated({ children }: { children: ReactNode }) {
     return (
       <View style={[s.center, { backgroundColor: c.background, padding: 32 }]}>
         <Feather name="alert-circle" size={28} color={c.destructive} />
-        <Text style={{ fontFamily: F.medium, fontSize: 18, color: c.foreground, marginTop: 12 }}>Could not read local data</Text>
+        <Text testID="local-data-read-error" style={{ fontFamily: F.medium, fontSize: 18, color: c.foreground, marginTop: 12 }}>Could not read local data</Text>
         <Text style={{ fontFamily: F.regular, fontSize: 14, color: c.mutedForeground, textAlign: 'center', marginVertical: 12 }}>Local storage on this device did not respond. Nothing has been overwritten.</Text>
-        <Button label="Try again" icon="refresh-cw" onPress={retry} />
+        <Button testID="retry-local-data-read" label="Try again" icon="refresh-cw" onPress={retry} />
       </View>
     );
   }
   return (
     <View style={{ flex: 1 }}>
       {children}
-      {saveError ? (
-        <View style={[s.toast, { backgroundColor: c.destructive }]}>
-          <Text style={{ fontFamily: F.medium, color: c.destructiveForeground, fontSize: 13 }}>Changes could not be saved on this device.</Text>
+      {saveError || onboardingSessionCompleted ? (
+        <View style={[s.toast, { backgroundColor: c.destructive }]} accessibilityRole="alert">
+          <Text testID="storage-save-warning" style={{ flex: 1, fontFamily: F.medium, color: c.destructiveForeground, fontSize: 13, lineHeight: 18 }}>
+            {onboardingSessionCompleted
+              ? 'Setup and changes are only in memory for this session; setup completion has not been saved to this device.'
+              : 'Your last saved data is intact. New changes are only in memory for this session until they save.'}
+          </Text>
+          <Button
+            testID="retry-storage-save"
+            label="Retry save"
+            icon="refresh-cw"
+            onPress={() => { void retrySave(); }}
+          />
         </View>
       ) : null}
     </View>
@@ -127,5 +137,5 @@ export function Hydrated({ children }: { children: ReactNode }) {
 const s = StyleSheet.create({
   btn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingHorizontal: 18, height: 46, borderRadius: 10, borderWidth: 1 },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  toast: { position: 'absolute', top: 60, left: 20, right: 20, padding: 12, borderRadius: 10 },
+  toast: { position: 'absolute', top: 60, left: 20, right: 20, padding: 12, borderRadius: 10, flexDirection: 'row', alignItems: 'center', gap: 10, zIndex: 10 },
 });
