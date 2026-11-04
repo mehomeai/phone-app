@@ -1,7 +1,7 @@
 import { Feather } from '@expo/vector-icons';
 import { router, useNavigation } from 'expo-router';
 import React, { useEffect, useMemo, useState } from 'react';
-import { Alert, FlatList, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Alert, FlatList, Platform, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import type { ListRenderItemInfo } from 'react-native';
 import { ChatComposer } from '@/components/ChatComposer';
 import { Card, F, Hydrated, ScreenHeader, StatusDot, tap } from '@/components/ui';
@@ -25,6 +25,32 @@ function confirm(title: string, msg: string, onYes: () => void) {
   Alert.alert(title, msg, [{ text: 'Cancel', style: 'cancel' }, { text: 'Delete', style: 'destructive', onPress: onYes }]);
 }
 
+function visibleMessageText(text: string) {
+  return text
+    .replace(/^\[Scripted demo reply\]\s*/, '')
+    .replace(/^\(Fictional demo\)\s*/, '');
+}
+
+type HistoryDateFilter = 'all' | 'today' | '7days' | '30days';
+
+function conversationActivityAt(conversation: Conversation) {
+  const latestMessage = conversation.messages.reduce((latest, message) => Math.max(latest, message.createdAt), 0);
+  return latestMessage || conversation.createdAt || 0;
+}
+
+function matchesHistoryDate(conversation: Conversation, filter: HistoryDateFilter, now = Date.now()) {
+  if (filter === 'all') return true;
+  const timestamp = conversationActivityAt(conversation);
+  if (!timestamp) return false;
+  if (filter === 'today') {
+    const current = new Date(now);
+    const startOfDay = new Date(current.getFullYear(), current.getMonth(), current.getDate()).getTime();
+    return timestamp >= startOfDay && timestamp <= now;
+  }
+  const days = filter === '7days' ? 7 : 30;
+  return timestamp >= now - days * 24 * 60 * 60 * 1000 && timestamp <= now;
+}
+
 function Chats() {
   const c = useColors();
   const navigation = useNavigation() as unknown as { addListener: (event: 'tabPress', listener: () => void) => () => void };
@@ -40,10 +66,14 @@ function Chats() {
   } = useMe();
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [showHistory, setShowHistory] = useState(false);
+  const [historyQuery, setHistoryQuery] = useState('');
+  const [historyDateFilter, setHistoryDateFilter] = useState<HistoryDateFilter>('all');
   const [draftVersion, setDraftVersion] = useState(0);
   useEffect(() => navigation.addListener('tabPress', () => {
     setConversationId(null);
     setShowHistory(false);
+    setHistoryQuery('');
+    setHistoryDateFilter('all');
     setDraftVersion((version) => version + 1);
   }), [navigation]);
   const history = useMemo(
@@ -52,11 +82,23 @@ function Chats() {
     () => visibleChats.filter((x) => x.messages.length > 0 || x.title.startsWith('Call with ')),
     [visibleChats],
   );
+  const normalizedQuery = historyQuery.trim().toLowerCase();
+  const filteredHistory = useMemo(
+    () => history.filter((conversation) =>
+      matchesHistoryDate(conversation, historyDateFilter) &&
+      (!normalizedQuery ||
+        conversation.title.toLowerCase().includes(normalizedQuery) ||
+        conversation.messages.some((message) => visibleMessageText(message.text).toLowerCase().includes(normalizedQuery))),
+    ),
+    [history, historyDateFilter, normalizedQuery],
+  );
 
   const startNew = () => {
     tap();
     setConversationId(null);
     setShowHistory(false);
+    setHistoryQuery('');
+    setHistoryDateFilter('all');
     setDraftVersion((version) => version + 1);
   };
   const startCall = () => {
@@ -144,7 +186,11 @@ function Chats() {
       <View style={{ flex: 1 }}>
         {showHistory ? (
           <HistoryList
-            conversations={history}
+            conversations={filteredHistory}
+            searchQuery={historyQuery}
+            dateFilter={historyDateFilter}
+            onSearchQueryChange={setHistoryQuery}
+            onDateFilterChange={setHistoryDateFilter}
             onOpen={(id) => { setConversationId(id); setShowHistory(false); }}
             onDelete={(item) => confirm('Delete conversation?', 'It will be removed from this device.', () => deleteConversation(item.id))}
           />
@@ -161,11 +207,30 @@ function Chats() {
   );
 }
 
-function HistoryList({ conversations, onOpen, onDelete }: { conversations: Conversation[]; onOpen: (id: string) => void; onDelete: (item: Conversation) => void }) {
+function HistoryList({
+  conversations,
+  searchQuery,
+  dateFilter,
+  onSearchQueryChange,
+  onDateFilterChange,
+  onOpen,
+  onDelete,
+}: {
+  conversations: Conversation[];
+  searchQuery: string;
+  dateFilter: HistoryDateFilter;
+  onSearchQueryChange: (value: string) => void;
+  onDateFilterChange: (value: HistoryDateFilter) => void;
+  onOpen: (id: string) => void;
+  onDelete: (item: Conversation) => void;
+}) {
   const c = useColors();
-  const visibleSnippet = (text: string) => text
-    .replace(/^\[Scripted demo reply\]\s*/, '')
-    .replace(/^\(Fictional demo\)\s*/, '');
+  const dateFilters: { id: HistoryDateFilter; label: string }[] = [
+    { id: 'all', label: 'All dates' },
+    { id: 'today', label: 'Today' },
+    { id: '7days', label: '7 days' },
+    { id: '30days', label: '30 days' },
+  ];
   return (
       <FlatList<Conversation>
         testID="chat-history-list"
@@ -174,17 +239,83 @@ function HistoryList({ conversations, onOpen, onDelete }: { conversations: Conve
       keyExtractor={(item) => item.id}
       scrollEnabled={conversations.length > 0}
       contentContainerStyle={{ padding: 20, paddingBottom: 90, gap: 10, flexGrow: 1 }}
-      ListHeaderComponent={<Text style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1.2, color: c.mutedForeground, marginBottom: 2 }}>PREVIOUS CONVERSATIONS</Text>}
+      ListHeaderComponent={
+        <View style={{ gap: 12, marginBottom: 3 }}>
+          <Text style={{ fontFamily: F.mono, fontSize: 10, letterSpacing: 1.2, color: c.mutedForeground }}>PREVIOUS CONVERSATIONS</Text>
+          <View style={[st.searchBar, { backgroundColor: c.card, borderColor: c.border }]}>
+            <Feather name="search" size={17} color={c.mutedForeground} />
+            <TextInput
+              testID="chat-history-search"
+              accessibilityLabel="Search conversation titles and messages"
+              value={searchQuery}
+              onChangeText={onSearchQueryChange}
+              placeholder="Search titles and messages"
+              placeholderTextColor={c.mutedForeground}
+              autoCapitalize="none"
+              autoCorrect={false}
+              returnKeyType="search"
+              style={[st.searchInput, { color: c.foreground }]}
+            />
+            {searchQuery.length > 0 ? (
+              <Pressable
+                testID="chat-history-search-clear"
+                accessibilityRole="button"
+                accessibilityLabel="Clear chat history search"
+                hitSlop={8}
+                onPress={() => onSearchQueryChange('')}
+                style={st.searchClear}
+              >
+                <Feather name="x" size={16} color={c.mutedForeground} />
+              </Pressable>
+            ) : null}
+          </View>
+          <View accessibilityRole="radiogroup" accessibilityLabel="Filter conversations by date" style={st.dateFilters}>
+            {dateFilters.map((filter) => (
+              <Pressable
+                key={filter.id}
+                testID={`chat-history-date-${filter.id}`}
+                accessibilityRole="radio"
+                accessibilityLabel={filter.label}
+                accessibilityState={{ checked: dateFilter === filter.id }}
+                onPress={() => onDateFilterChange(filter.id)}
+                style={[
+                  st.dateFilter,
+                  {
+                    backgroundColor: dateFilter === filter.id ? c.accentSoft : c.card,
+                    borderColor: dateFilter === filter.id ? c.accent : c.border,
+                  },
+                ]}
+              >
+                <Text style={{ fontFamily: F.medium, fontSize: 12, color: dateFilter === filter.id ? c.accent : c.mutedForeground }}>
+                  {filter.label}
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+        </View>
+      }
       ListEmptyComponent={
         <View style={st.empty}>
-          <Feather name="clock" size={27} color={c.mutedForeground} />
-          <Text style={{ fontFamily: F.medium, fontSize: 17, color: c.foreground, marginTop: 12 }}>Nothing here yet</Text>
-              <Text style={{ fontFamily: F.regular, fontSize: 14, color: c.mutedForeground, textAlign: 'center', marginTop: 4 }}>Conversations appear after you send a message or make a call.</Text>
+          <Feather name={searchQuery.trim() ? 'search' : 'clock'} size={27} color={c.mutedForeground} />
+          <Text style={{ fontFamily: F.medium, fontSize: 17, color: c.foreground, marginTop: 12 }}>
+            {searchQuery.trim() ? 'No matches' : dateFilter !== 'all' ? 'No conversations in this period' : 'Nothing here yet'}
+          </Text>
+          <Text style={{ fontFamily: F.regular, fontSize: 14, color: c.mutedForeground, textAlign: 'center', marginTop: 4 }}>
+            {searchQuery.trim()
+              ? 'Try another title or message, or broaden the date range.'
+              : dateFilter !== 'all'
+                ? 'Choose a wider date range to see older conversations.'
+                : 'Conversations appear after you send a message or make a call.'}
+          </Text>
         </View>
       }
       renderItem={({ item }: ListRenderItemInfo<Conversation>) => {
-        const last = item.messages[item.messages.length - 1];
-        const snippet = last ? visibleSnippet(last.text) : 'Simulated call · no audio';
+        const normalizedSearch = searchQuery.trim().toLowerCase();
+        const matchingMessage = normalizedSearch
+          ? item.messages.find((message) => visibleMessageText(message.text).toLowerCase().includes(normalizedSearch))
+          : undefined;
+        const last = matchingMessage ?? item.messages[item.messages.length - 1];
+        const snippet = last ? visibleMessageText(last.text) : 'Simulated call · no audio';
         // Ported from the Replit copy's Nov 3 fix: a new conversation's
         // title is its first message (truncated to 42 chars), so when the
         // latest message is still that first one, the preview line would
@@ -227,6 +358,11 @@ const st = StyleSheet.create({
   iconButton: { width: 38, height: 38, borderRadius: 12, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
   banner: { marginHorizontal: 20, padding: 10, borderRadius: 10, flexDirection: 'row', alignItems: 'center', gap: 8 },
   empty: { flex: 1, minHeight: 240, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 20 },
+  searchBar: { minHeight: 46, borderWidth: 1, borderRadius: 13, paddingHorizontal: 12, flexDirection: 'row', alignItems: 'center', gap: 9 },
+  searchInput: { flex: 1, minWidth: 0, paddingVertical: 10, fontFamily: F.regular, fontSize: 14 },
+  searchClear: { width: 28, height: 32, alignItems: 'center', justifyContent: 'center' },
+  dateFilters: { flexDirection: 'row', flexWrap: 'wrap', gap: 7 },
+  dateFilter: { minHeight: 34, justifyContent: 'center', borderWidth: 1, borderRadius: 999, paddingHorizontal: 12, paddingVertical: 6 },
   historyRow: { flex: 1, minHeight: 72, flexDirection: 'row', alignItems: 'center', gap: 11, paddingLeft: 12, paddingRight: 6 },
   historyMark: { width: 34, height: 34, borderRadius: 11, alignItems: 'center', justifyContent: 'center' },
 });
