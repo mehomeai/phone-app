@@ -9,14 +9,18 @@
 // tests run with zero native installs.
 //
 // Declared SDK (apps/mobile/package.json, not installed on disk here):
-//   expo-notifications ~58.0.11, expo-device ~58.0.1, expo-constants ~58.0.12.
+//   expo-notifications ~58.1.8, expo-device ~58.0.1, expo-constants ~58.0.12.
 // Official API used (Expo SDK 58 docs):
 //   getPermissionsAsync / requestPermissionsAsync,
 //   getExpoPushTokenAsync({ projectId }),
 //   addNotificationReceivedListener / addNotificationResponseReceivedListener,
-//   removeNotificationSubscription,
 //   setNotificationChannelAsync (+ AndroidImportance.DEFAULT) for the default
 //   channel on Android.
+// Subscription removal uses EventSubscription.remove() on the object each
+// add*Listener call returns; expo-notifications 58.1.8 exports no
+// removeNotificationSubscription (verified against the published types), so
+// the injected SDK keeps it only as an optional fallback in
+// removeSdkSubscription below.
 //
 // Security/privacy rules enforced by the caller (MeContext) with helpers here:
 // - No first-launch surprise: nothing is prompted or registered until the
