@@ -39,13 +39,13 @@ jobs:
             echo "source branch: $(git rev-parse --abbrev-ref HEAD)"
             echo "node: $(node --version)"
             echo "npm: $(npm --version)"
-          } | tee ../regen-versions.txt
-          git rev-parse HEAD > ../regen-source-sha.txt
+          } | tee regen-versions.txt
+          git rev-parse HEAD > regen-source-sha.txt
       - name: Regenerate lockfile from existing lockfile (targeted install)
         run: |
-          npm install --package-lock-only --ignore-scripts 2>&1 | tee ../regen-log.txt
-          echo "--- npm ci verification ---" >> ../regen-log.txt
-          npm ci 2>&1 | tee -a ../regen-log.txt
+          npm install --package-lock-only --ignore-scripts 2>&1 | tee regen-log.txt
+          echo "--- npm ci verification ---" >> regen-log.txt
+          npm ci 2>&1 | tee -a regen-log.txt
       - name: Verify resolved versions
         run: |
           {
@@ -53,14 +53,16 @@ jobs:
             npm ls react react-dom react-native react-native-safe-area-context expo-notifications @types/react-dom @babel/core react-native-reanimated react-native-worklets
             echo "--- expo install --check ---"
             npx --no-install expo install --check || true
-          } | tee -a ../regen-log.txt
+          } | tee -a regen-log.txt
+      - name: List evidence files before upload
+        run: ls -la regen-versions.txt regen-source-sha.txt regen-log.txt package-lock.json
       - name: Upload lockfile and generation evidence
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sdk58-pr-a-lockfile-${{ github.run_id }}
           path: |
             apps/mobile/package-lock.json
-            regen-log.txt
-            regen-versions.txt
-            regen-source-sha.txt
+            apps/mobile/regen-log.txt
+            apps/mobile/regen-versions.txt
+            apps/mobile/regen-source-sha.txt
           if-no-files-found: error
