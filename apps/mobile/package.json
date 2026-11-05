@@ -9,6 +9,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "check:clip-media": "node scripts/check-clip-media.cjs",
     "test:clip-sources": "node --test tests/check-clip-sources.test.cjs",
+    "test:storage-continuity": "node --test tests/storage-continuity.test.cjs",
     "test:web": "expo export --platform web --output-dir .expo-web-dist && PORT=4173 node scripts/serve-web-dist.cjs",
     "test:web:error-boundary": "EXPO_PUBLIC_TEST_ERROR_BOUNDARY=true expo export --platform web --output-dir .expo-web-dist && PORT=4174 node scripts/serve-web-dist.cjs",
     "test:ui": "playwright test --config playwright.config.js",
