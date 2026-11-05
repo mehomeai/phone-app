@@ -29,12 +29,6 @@
         }
       ]
     ],
-    "notification": {
-      "icon": "./assets/images/icon.png",
-      "color": "#ffffff",
-      "androidMode": "default",
-      "androidCollapsedTitle": "Me Home"
-    },
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
