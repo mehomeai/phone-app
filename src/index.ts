@@ -237,6 +237,16 @@ export {
   UpstreamNativeScope,
 } from './upstream-native.ts';
 export type {
+  ConversationSearchInput,
+  ConversationSearchOptions,
+  ConversationSearchHit,
+  ConversationSearchIndex,
+} from './conversation-search.ts';
+export {
+  buildConversationSearchIndex,
+  searchConversations,
+} from './conversation-search.ts';
+export type {
   ChannelBinding,
   DisplayMessage,
   PendingSend,
